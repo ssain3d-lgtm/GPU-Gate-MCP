@@ -378,6 +378,39 @@ def test_wait_does_not_interrupt_a_prompt_that_already_finished(fake_comfy, cloc
     assert ("POST", "/interrupt") not in fake.calls
 
 
+def test_wait_returns_an_error_at_once_when_the_process_has_ended(fake_comfy, clock):
+    fake, cfg = fake_comfy
+    r = comfyui.wait(cfg, "p1", 60, lambda: False, clock.sleep, clock.now, alive=lambda: False)
+    assert r["status"] == "error" and r["error"] == "comfyui process ended" and r["outputs"] == []
+    assert fake.calls == [("GET", "/history/p1")]  # one poll, then it gave up
+    assert clock.sleeps == []
+
+
+def test_wait_keeps_polling_while_the_process_is_alive(fake_comfy, clock):
+    fake, cfg = fake_comfy
+    states = iter([True, True, False])
+    r = comfyui.wait(cfg, "p1", 60, lambda: False, clock.sleep, clock.now, alive=lambda: next(states))
+    assert r["status"] == "error" and r["error"] == "comfyui process ended"
+    assert clock.sleeps == [1.5, 1.5] and r["seconds"] == 3.0
+    assert fake.calls.count(("GET", "/history/p1")) == 3
+
+
+def test_wait_with_a_dead_process_still_lists_the_outputs_already_in_history(fake_comfy, clock, tmp_path):
+    fake, cfg = fake_comfy
+    fake.complete("p1", [("a.png", "sub", "output")])
+    fake.history["p1"]["status"] = {"status_str": "success", "completed": False, "messages": []}
+    r = comfyui.wait(cfg, "p1", 60, lambda: False, clock.sleep, clock.now, alive=lambda: False)
+    assert r["status"] == "error" and r["error"] == "comfyui process ended"
+    assert r["outputs"] == [str(tmp_path / "ComfyUI" / "output" / "sub" / "a.png")]
+
+
+def test_wait_reports_done_when_the_prompt_finished_before_the_process_ended(fake_comfy, clock):
+    fake, cfg = fake_comfy
+    fake.complete("p1", [("a.png", "", "output")])
+    r = comfyui.wait(cfg, "p1", 60, lambda: False, clock.sleep, clock.now, alive=lambda: False)
+    assert r["status"] == "done" and len(r["outputs"]) == 1
+
+
 # --- free and stop ---------------------------------------------------------------------------
 
 
@@ -392,38 +425,82 @@ def test_free_is_false_when_nothing_answers(silent_cfg):
     assert comfyui.free(silent_cfg) is False
 
 
+def test_delete_pending_posts_the_ids_to_the_queue(fake_comfy):
+    fake, cfg = fake_comfy
+    assert comfyui.delete_pending(cfg, ["p2", "p3"]) is True
+    assert ("POST", "/queue") in fake.calls
+    assert fake.queue_posts == [{"delete": ["p2", "p3"]}]
+
+
+def test_delete_pending_sends_nothing_for_an_empty_list(fake_comfy):
+    fake, cfg = fake_comfy
+    assert comfyui.delete_pending(cfg, []) is True
+    assert fake.calls == []
+
+
+def test_delete_pending_is_false_when_nothing_answers(silent_cfg):
+    assert comfyui.delete_pending(silent_cfg, ["p2"]) is False
+
+
+STOP_CFG = ComfyCfg(dir=".", bat="x.bat", url="http://127.0.0.1:8188")
+
+
+def forbidden_kill(pid, sig):
+    pytest.fail(f"os.kill({pid}, {sig}) must not be called")
+
+
 def test_stop_kills_listener_when_no_proc(monkeypatch, clock, lines):
-    cfg = ComfyCfg(dir=".", bat="x.bat", url="http://127.0.0.1:8188")
-    asked, signalled, killed = [], [], []
+    # The test the brief asks for, on Windows terms: no pid_alive faking, kill_tree(4242) is seen.
+    asked, killed = [], []
+    monkeypatch.setattr(procs, "IS_WINDOWS", True)
     monkeypatch.setattr(procs, "listener_pids", lambda port: asked.append(port) or [4242])
-    monkeypatch.setattr(procs, "pid_alive", lambda pid: pid not in killed)
     monkeypatch.setattr(procs, "kill_tree", lambda pid: killed.append(pid) or True)
-    monkeypatch.setattr(os, "kill", lambda pid, sig: signalled.append(pid))  # never touch a real pid
-    r = comfyui.stop(cfg, None, lines, sleep=clock.sleep)
+    monkeypatch.setattr(os, "kill", forbidden_kill)  # never touch a real pid
+    r = comfyui.stop(STOP_CFG, None, lines, sleep=clock.sleep)
     assert r == {"stopped": True, "pids": [4242]}
-    assert asked == [8188] and signalled == [4242] and killed == [4242]
-    assert clock.sleeps == [0.5] * 20  # it ignored the terminate for the whole 10 s
+    assert asked == [8188] and killed == [4242]
+    assert clock.sleeps == []  # no 10 s grace: on Windows terminating would only orphan the children
     assert lines  # something was logged
 
 
-def test_stop_does_not_wait_when_the_process_exits_after_terminate(monkeypatch, clock, lines):
-    cfg = ComfyCfg(dir=".", bat="x.bat", url="http://127.0.0.1:8188")
-    gone = []
+def test_stop_off_windows_terminates_then_waits_10s_then_kills_the_tree(monkeypatch, clock, lines):
+    events = []
+    monkeypatch.setattr(procs, "IS_WINDOWS", False)
+    monkeypatch.setattr(procs, "listener_pids", lambda port: [4242])
+    monkeypatch.setattr(procs, "pid_alive", lambda pid: True)  # it ignores the terminate
+    monkeypatch.setattr(procs, "kill_tree", lambda pid: events.append(("kill_tree", pid)) or True)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append(("terminate", pid)))
+    r = comfyui.stop(STOP_CFG, None, lines, sleep=clock.sleep)
+    assert r == {"stopped": True, "pids": [4242]}
+    assert events == [("terminate", 4242), ("kill_tree", 4242)]
+    assert clock.sleeps == [0.5] * 20
+
+
+def test_stop_off_windows_does_not_wait_when_the_process_exits_but_still_calls_kill_tree(
+    monkeypatch, clock, lines
+):
+    gone, killed = [], []
+    monkeypatch.setattr(procs, "IS_WINDOWS", False)
     monkeypatch.setattr(procs, "listener_pids", lambda port: [4242, 4243])
     monkeypatch.setattr(procs, "pid_alive", lambda pid: pid not in gone)
-    monkeypatch.setattr(procs, "kill_tree", lambda pid: True)
+    monkeypatch.setattr(procs, "kill_tree", lambda pid: killed.append(pid) or True)
     monkeypatch.setattr(os, "kill", lambda pid, sig: gone.append(pid))
-    r = comfyui.stop(cfg, None, lines, sleep=clock.sleep)
+    r = comfyui.stop(STOP_CFG, None, lines, sleep=clock.sleep)
     assert r == {"stopped": True, "pids": [4242, 4243]} and clock.sleeps == []
+    assert killed == [4242, 4243]  # kill_tree is not gated on pid_alive
 
 
-def test_stop_reports_a_process_that_survives(monkeypatch, clock, lines):
-    cfg = ComfyCfg(dir=".", bat="x.bat", url="http://127.0.0.1:8188")
-    monkeypatch.setattr(procs, "listener_pids", lambda port: [4242])
+@pytest.mark.parametrize("windows", [True, False])
+def test_stop_reports_a_process_that_will_not_die(monkeypatch, clock, lines, windows):
+    killed = []
+    monkeypatch.setattr(procs, "IS_WINDOWS", windows)
+    monkeypatch.setattr(procs, "listener_pids", lambda port: [4242, 4243])
     monkeypatch.setattr(procs, "pid_alive", lambda pid: True)
-    monkeypatch.setattr(procs, "kill_tree", lambda pid: False)
+    monkeypatch.setattr(procs, "kill_tree", lambda pid: killed.append(pid) or pid == 4243)
     monkeypatch.setattr(os, "kill", lambda pid, sig: None)
-    assert comfyui.stop(cfg, None, lines, sleep=clock.sleep) == {"stopped": False, "pids": [4242]}
+    r = comfyui.stop(STOP_CFG, None, lines, sleep=clock.sleep)
+    assert r == {"stopped": False, "pids": [4242, 4243]}
+    assert killed == [4242, 4243]  # the second is still tried after the first fails
 
 
 def test_stop_with_nothing_listening_does_nothing(monkeypatch, clock, lines):

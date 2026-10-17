@@ -213,6 +213,7 @@ class FakeComfy(FakeServer):
     history: {prompt_id: entry}; /history/<id> answers {id: entry} once it is there and {} before
         (a prompt that is still pending or running); complete() fills it the way ComfyUI does.
     prompts: the parsed bodies of the /prompt requests that were accepted or rejected.
+    queue_posts: the parsed bodies of POST /queue requests (for example {"delete": ["p2"]}).
     Prompt ids are "p1", "p2", ... in submission order.
     """
 
@@ -221,6 +222,7 @@ class FakeComfy(FakeServer):
         self.reject = reject
         self.history: dict = {}
         self.prompts: list = []
+        self.queue_posts: list = []
 
     def complete(self, prompt_id: str, files=(), error: str | None = None) -> None:
         """Finish a prompt. files: (filename, subfolder, type) entries of node 9's images output;
@@ -288,4 +290,7 @@ class FakeComfy(FakeServer):
             return 200, b""  # the real server answers with an empty body
         if method == "GET" and route == "/queue":
             return 200, {"queue_running": [], "queue_pending": []}
+        if method == "POST" and route == "/queue":
+            self.queue_posts.append(json.loads(body.decode("utf-8")))
+            return 200, b""
         return super().handle(method, path, body)

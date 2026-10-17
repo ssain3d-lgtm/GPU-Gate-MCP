@@ -324,13 +324,16 @@ def wait(
     cancelled: Callable[[], bool],
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
+    alive: Callable[[], bool] | None = None,
 ) -> dict:
     """Poll /history/<id> every 1.5 s until the prompt ends.
 
     Returns {"status": "done" | "error" | "timeout" | "cancelled", "seconds", "outputs", "error"}.
     outputs (done only) are the saved files' paths. When cancelled() turns true, a prompt that is
     still unfinished is interrupted (POST /interrupt) and "cancelled" is returned; a timeout leaves
-    the prompt running.
+    the prompt running. alive, when given, says whether the ComfyUI process still runs: once it
+    returns False on a poll, the prompt did not finish and the result is "error" ("comfyui process
+    ended") at once, with any outputs the history already lists.
     """
     t0 = now()
 
@@ -348,6 +351,9 @@ def wait(
                 return result("error", error=_error_message(entry))
             if state.get("completed"):
                 return result("done", _output_paths(cfg, entry))
+        if alive is not None and not alive():
+            outputs = _output_paths(cfg, entry) if isinstance(entry, dict) else []
+            return result("error", outputs, "comfyui process ended")
         if cancelled():
             http.http_json(cfg.url.rstrip("/") + "/interrupt", "POST")
             return result("cancelled")
@@ -367,6 +373,16 @@ def free(cfg: ComfyCfg) -> bool:
     return code == 200
 
 
+def delete_pending(cfg: ComfyCfg, prompt_ids: list[str]) -> bool:
+    """Remove queued prompts that have not started (POST /queue {"delete": [...]}); True when
+    ComfyUI said OK. Nothing is sent, and True returned, for an empty list. A prompt that is
+    already running is not affected: that is what /interrupt (see wait) is for."""
+    if not prompt_ids:
+        return True
+    code, _ = http.http_json(cfg.url.rstrip("/") + "/queue", "POST", {"delete": list(prompt_ids)})
+    return code == 200
+
+
 # --- stopping ----------------------------------------------------------------------------------
 
 
@@ -382,7 +398,7 @@ def _terminate(pid: int, proc: subprocess.Popen | None) -> None:
         else:
             os.kill(pid, signal.SIGTERM)
     except OSError:
-        pass  # already gone, or not ours to end: kill_tree and the final check settle it
+        pass  # already gone, or not ours to end: kill_tree settles it
 
 
 def _alive(pid: int, proc: subprocess.Popen | None) -> bool:
@@ -397,12 +413,17 @@ def stop(
     log: Log,
     sleep: Callable[[float], None] | None = None,
 ) -> dict:
-    """End ComfyUI: terminate it, give it 10 s to exit, then kill_tree whatever is still running.
+    """End ComfyUI and everything it started.
 
-    The process is proc when given, else whatever listens on the port of cfg.url. Returns
-    {"stopped", "pids"}: pids are the processes aimed at (empty when nothing was running, which is
-    not "stopped"); stopped is True when there was at least one and none is left running.
-    A pid that already exited is never passed to kill_tree (the system may have reused the number).
+    The process is proc when given, else whatever listens on the port of cfg.url. On Windows
+    terminating is not graceful (TerminateProcess), and the parent dying first would orphan its
+    children, so the process tree is killed at once. Elsewhere the process is terminated, given 10 s
+    to exit, and the tree is killed after that. kill_tree always runs for every pid (it is True for
+    one that is already gone).
+
+    Returns {"stopped", "pids"}: pids are the processes aimed at (empty when nothing was running,
+    which is not "stopped"); stopped is True when there was at least one and kill_tree reports every
+    one gone.
     """
     sleep = sleep or time.sleep  # looked up here so a patched time.sleep is honoured
     pids = [proc.pid] if proc is not None else procs.listener_pids(_port(cfg.url))
@@ -410,16 +431,16 @@ def stop(
         log("comfyui: nothing to stop")
         return {"stopped": False, "pids": []}
     log(f"comfyui: stopping pids {pids}")
-    for pid in pids:
-        _terminate(pid, proc)
-    for _ in range(STOP_WAIT_ROUNDS):
-        if not any(_alive(pid, proc) for pid in pids):
-            break
-        sleep(STOP_POLL_S)
-    for pid in pids:
-        if _alive(pid, proc):
-            log(f"comfyui: pid {pid} ignored the terminate, killing its process tree")
-            procs.kill_tree(pid)
-    stopped = not any(_alive(pid, proc) for pid in pids)
+    if not procs.IS_WINDOWS:
+        for pid in pids:
+            _terminate(pid, proc)
+        for _ in range(STOP_WAIT_ROUNDS):
+            if not any(_alive(pid, proc) for pid in pids):
+                break
+            sleep(STOP_POLL_S)
+    gone = [bool(procs.kill_tree(pid)) for pid in pids]  # every pid, even after one fails
+    if proc is not None:
+        proc.poll()  # collect the exit status: no zombie, no ResourceWarning
+    stopped = all(gone)
     log("comfyui: stopped" if stopped else f"comfyui: could not stop pids {pids}")
     return {"stopped": stopped, "pids": pids}
