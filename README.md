@@ -100,7 +100,7 @@ python gpu_gate_server.py --init
 | `GPU_GATE_HOME` | 상태 디렉터리(기본값은 아래 파일 규약 참고). |
 | `GPU_GATE_CONFIG` | 설정 파일 경로(기본값은 `<상태 디렉터리>/config.json`). `--config` 가 이 값을 정한다. |
 
-ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경변수로 모으고(`%~dp0`, `%VAR%` 는 풀어서), `main.py` 로 끝나는 토큰이 있는 첫 줄을 실행 줄로 쓴다. 상대 경로는 `.bat` 폴더 기준 절대 경로로 바꾸고, `--disable-auto-launch` 가 없으면 붙인다(브라우저가 열리지 않게). `if`/`call`/`for`/`set /a` 같은 줄은 해석하지 않고 건너뛰므로, 가상환경을 `call ...activate` 로 켜는 `.bat` 이라면 실행 줄에 파이썬 경로를 직접 적거나 `comfyui.command` 를 쓴다. 로그에는 환경변수의 이름만 남고 값은 남지 않는다(실행 줄로 풀려 들어간 4자 이상의 값은 `<이름>` 으로 가려진다).
+ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경변수로 모으고(`%~dp0`, `%VAR%` 는 풀어서), `main.py` 로 끝나는 토큰이 있는 첫 줄을 실행 줄로 쓴다. 상대 경로는 `.bat` 폴더 기준 절대 경로로 바꾸고, `--disable-auto-launch` 가 없으면 붙인다(브라우저가 열리지 않게). `if`/`call`/`for`/`set /a` 같은 줄은 해석하지 않고 건너뛰므로, 가상환경을 `call ...activate` 로 켜는 `.bat` 이라면 실행 줄에 파이썬 경로를 직접 적거나 `comfyui.command` 를 쓴다. 게이트가 쓰는 시작 줄(`comfyui: starting ...`)에는 환경변수의 이름만 남고 값은 남지 않는다(실행 줄로 풀려 들어간 4자 이상의 값은 `<이름>` 으로 가려진다). 그 뒤에 쌓이는 실행기 자체의 출력은 거르지 않는다.
 
 ## Strata 에게 바라는 것
 
