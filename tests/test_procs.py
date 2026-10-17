@@ -126,3 +126,30 @@ def test_stop_pids_reports_false_for_a_pid_that_will_not_die(monkeypatch):
     monkeypatch.setattr(os, "kill", lambda pid, sig: None)
     assert procs.stop_pids([1, 2]) is False
     assert killed == [1, 2]  # the second is still tried after the first fails
+
+
+def test_process_name_reads_tasklist_csv_and_drops_exe(monkeypatch):
+    seen = []
+    monkeypatch.setattr(procs, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        procs,
+        "_run_quiet",
+        lambda argv, timeout=30: seen.append(argv) or '"python.exe","12356","Console","1","1,234 K"\n',
+    )
+    assert procs.process_name(12356) == "python"
+    assert seen == [["tasklist", "/FO", "CSV", "/NH", "/FI", "PID eq 12356"]]
+
+
+def test_process_name_is_none_when_tasklist_finds_nothing(monkeypatch):
+    monkeypatch.setattr(procs, "IS_WINDOWS", True)
+    for text in ("", "INFO: No tasks are running which match the specified criteria.\r\n"):
+        monkeypatch.setattr(procs, "_run_quiet", lambda argv, timeout=30, text=text: text)
+        assert procs.process_name(1) is None
+
+
+def test_process_name_reads_proc_comm_off_windows(monkeypatch, tmp_path):
+    (tmp_path / "42.comm").write_text("python3\n")
+    monkeypatch.setattr(procs, "IS_WINDOWS", False)
+    monkeypatch.setattr(procs, "_COMM_PATH", str(tmp_path / "{pid}.comm"))
+    assert procs.process_name(42) == "python3"
+    assert procs.process_name(43) is None

@@ -6,7 +6,9 @@ the POSIX branches are deliberately minimal.
 
 from __future__ import annotations
 
+import csv
 import functools
+import io
 import os
 import re
 import signal
@@ -31,6 +33,8 @@ ERROR_ACCESS_DENIED = 5
 _KILL_WAIT_SECONDS = 3.0
 STOP_WAIT_ROUNDS = 20  # stop_pids gives a terminated process 20 x 0.5 s = 10 s to exit
 STOP_POLL_S = 0.5
+
+_COMM_PATH = "/proc/{pid}/comm"
 
 
 def _run_quiet(argv: list[str], timeout: float = 30) -> str:
@@ -130,6 +134,28 @@ def pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def process_name(pid: int) -> str | None:
+    """The image name of a running process ("python" for python.exe), or None when unknown."""
+    if pid <= 0:
+        return None
+    if not IS_WINDOWS:
+        try:
+            with open(_COMM_PATH.format(pid=pid), encoding="utf-8", errors="replace") as comm:
+                return comm.read().strip() or None
+        except OSError:
+            return None
+    text = _run_quiet(["tasklist", "/FO", "CSV", "/NH", "/FI", f"PID eq {pid}"])
+    try:
+        for row in csv.reader(io.StringIO(text)):
+            # "python.exe","12356","Console","1","1,234 K"; a miss prints one INFO sentence instead
+            if len(row) >= 2 and row[1] == str(pid) and row[0]:
+                name = row[0]
+                return name[:-4] if name.lower().endswith(".exe") else name
+    except csv.Error:
+        pass
+    return None
 
 
 def kill_tree(pid: int) -> bool:
