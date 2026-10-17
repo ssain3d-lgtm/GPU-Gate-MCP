@@ -337,6 +337,77 @@ def test_serve_returns_promptly_when_stdin_closes_during_a_batch(home, tmp_path,
         assert not thread.is_alive()
 
 
+JOBS3 = [{"kind": "workflow", "path": f"/tmp/{name}.json"} for name in ("a", "b", "c")]
+
+
+def serve_a_batch(home, tmp_path, fake_strata, meta=None, polls=3):
+    """Serve one comfy_batch call whose (fake) worker moves one job a poll and finishes after
+    `polls` polls; the stdout messages in order."""
+    _, strata_cfg = fake_strata
+    cfg = make_cfg(tmp_path, strata_cfg)
+    spawn = FakeSpawn(mode="live")
+    finished = threading.Event()
+    seen = []
+
+    def sleep(seconds):
+        seen.append(seconds)
+        path = spawn.paths[0]
+        doc = state.read_json(path)
+        done = len(seen)
+        doc.update(state="running", progress={"done": done, "total": 3, "current": f"job {done}"})
+        state.write_json(path, doc)
+        if done >= polls:
+            finish_batch(path)
+            finished.set()
+
+    server = Server(home, lambda: cfg, spawn, poll_interval=0.01, sleep=sleep)
+    params = {"name": "comfy_batch", "arguments": {"jobs": JOBS3}}
+    if meta is not None:
+        params["_meta"] = meta
+    line = json.dumps(rpc("tools/call", params, id=11)).encode("utf-8") + b"\n"
+
+    def stdin():
+        yield line
+        assert finished.wait(5)
+
+    out = io.BytesIO()
+    server.serve(stdin(), out)
+    return [json.loads(raw) for raw in out.getvalue().decode("utf-8").splitlines()]
+
+
+@pytest.mark.parametrize("token", ["tok-1", 42])
+def test_progress_notifications_carry_the_token_until_the_result(home, tmp_path, fake_strata, token):
+    messages = serve_a_batch(home, tmp_path, fake_strata, meta={"progressToken": token})
+    reply = next(i for i, m in enumerate(messages) if m.get("id") == 11)
+    assert reply == len(messages) - 1  # the result comes last
+    progress = [m for m in messages[:reply] if m.get("method") == "notifications/progress"]
+    assert len(progress) >= 3 and len(progress) == reply
+    for m in progress:
+        assert m["jsonrpc"] == "2.0" and "id" not in m
+        assert m["params"]["progressToken"] == token
+        assert m["params"]["total"] == 3
+        assert len(m["params"]["message"]) <= 120
+    values = [m["params"]["progress"] for m in progress]
+    assert values == sorted(values) and values[0] == 0
+    assert progress[1]["params"]["message"] == "running 1/3 job 1"
+    assert messages[reply]["result"]["isError"] is False
+
+
+@pytest.mark.parametrize("meta", [None, {}, {"progressToken": True}, {"progressToken": [1]}])
+def test_no_progress_notifications_without_a_token(home, tmp_path, fake_strata, meta):
+    messages = serve_a_batch(home, tmp_path, fake_strata, meta=meta)
+    assert [m.get("id") for m in messages] == [11]
+    assert not any(m.get("method") == "notifications/progress" for m in messages)
+
+
+def test_progress_message_is_short_and_total_is_optional():
+    from gpu_gate.server import progress_params
+    p = progress_params("t", {"state": "running", "progress": {"done": 1, "total": None, "current": "x" * 300}})
+    assert p == {"progressToken": "t", "progress": 1, "message": p["message"]}
+    assert len(p["message"]) <= 120 and p["message"].startswith("running 1/? x")
+    assert progress_params("t", {"state": "pending"}) == {"progressToken": "t", "progress": 0, "message": "pending 0/?"}
+
+
 def test_lock_is_released_when_the_spawn_fails_and_the_disk_does_too(server, home, spawn, monkeypatch):
     real_write_json = state.write_json
 

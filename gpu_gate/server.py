@@ -2,6 +2,9 @@
 
 `comfy_batch` / `voice_batch` write a batch file, start the detached worker on it and read the file
 every `poll_interval` seconds until the worker writes `finished`; the call blocks for the whole batch.
+When the request carries `params._meta.progressToken`, every read of the batch file also sends a
+`notifications/progress` (decided jobs / all jobs), which keeps a client's idle timer from ending
+the call.
 `gate_status` is a read-only snapshot of the state directory and the servers. stdout carries only
 protocol lines; diagnostics go to stderr.
 
@@ -24,6 +27,7 @@ PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 EOF_GRACE_S = 1.0  # at end of input, how long calls in progress get to write their reply
 WARN_VRAM_MB = 300  # another process holding this much while the LLM is loaded is worth a warning
 WARN_DWM_MB = 3072  # the desktop compositor always holds some; only a lot of it is worth one
+MAX_PROGRESS_CHARS = 120  # the message of a progress notification
 LAUNCHER = Path(__file__).resolve().parent.parent / "gpu_gate_server.py"
 
 INSTRUCTIONS = (
@@ -202,6 +206,35 @@ def _valid_id(value: Any) -> bool:
     return value is None or isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))
 
 
+def _progress_token(params: dict) -> str | int | None:
+    """params._meta.progressToken when it is a string or an integer (not a bool), else None."""
+    meta = params.get("_meta")
+    token = meta.get("progressToken") if isinstance(meta, dict) else None
+    if isinstance(token, str) or (isinstance(token, int) and not isinstance(token, bool)):
+        return token
+    return None
+
+
+def _count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def progress_params(token: str | int, doc: dict) -> dict:
+    """The params of a notifications/progress for the batch file doc: progress is the number of
+    decided jobs, total the number of jobs (left out when unknown), message
+    "<state> <done>/<total> <current job>" in at most MAX_PROGRESS_CHARS characters."""
+    progress = doc.get("progress") if isinstance(doc.get("progress"), dict) else {}
+    done = _count(progress.get("done")) or 0
+    total = _count(progress.get("total"))
+    current = progress.get("current") or ""
+    message = _one_line(f"{doc.get('state') or 'pending'} {done}/{'?' if total is None else total} {current}")
+    params: dict = {"progressToken": token, "progress": done}
+    if total is not None:
+        params["total"] = total
+    params["message"] = message[:MAX_PROGRESS_CHARS]
+    return params
+
+
 def _tool_result(res: dict, is_error: bool) -> dict:
     return {
         "content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=1)}],
@@ -313,7 +346,7 @@ class Server:
         try:
             if name == "gate_status":
                 return _tool_result(self.gate_status(), False)
-            return _tool_result(self._batch(_BATCH_KINDS[name], args, rid), False)
+            return _tool_result(self._batch(_BATCH_KINDS[name], args, rid, _progress_token(params)), False)
         except _ToolError as err:
             return _tool_result(err.res, True)
         except Exception as err:
@@ -382,15 +415,32 @@ class Server:
         except Exception as err:
             print(f"gpu-gate: could not release the lock of batch {batch_id}: {_describe(err)}", file=sys.stderr)
 
-    def _batch(self, kind: str, args: dict, rid: Any) -> dict:
+    def _batch(self, kind: str, args: dict, rid: Any, token: str | int | None = None) -> dict:
         if not self._batch_mu.acquire(blocking=False):
             raise _ToolError({"error": "busy", "batch": self._live_batch()})
         try:
-            return self._run_batch(kind, args, rid)
+            return self._run_batch(kind, args, rid, token)
         finally:
             self._batch_mu.release()
 
-    def _run_batch(self, kind: str, args: dict, rid: Any) -> dict:
+    def _progress_sender(self, rid: Any, token: str | int | None) -> Callable[[dict], None] | None:
+        """notify(doc) sending a notifications/progress for request rid, or None without a token.
+        Some clients (Qwen Code) end a call after a stretch without messages; progress resets
+        that timer. Nothing is sent once the request is cancelled."""
+        if token is None:
+            return None
+
+        def notify(doc: dict) -> None:
+            with self._mu:
+                record = self._running.get(rid)
+                if record is None or record["cancelled"]:
+                    return
+            self._send({"jsonrpc": "2.0", "method": "notifications/progress",
+                        "params": progress_params(token, doc)})
+
+        return notify
+
+    def _run_batch(self, kind: str, args: dict, rid: Any, token: str | int | None = None) -> dict:
         try:
             cfg = self.cfg_loader()
         except config.ConfigError as err:
@@ -410,7 +460,7 @@ class Server:
             record = self._running.get(rid)
             if record is not None:
                 record["pid"] = pid
-        return self._wait(cfg, path, doc, batch_id, pid, log_path, log)
+        return self._wait(cfg, path, doc, batch_id, pid, log_path, log, self._progress_sender(rid, token))
 
     def _start(self, cfg, kind: str, args: dict, rid: Any, lock: state.Lock, batch_id: str):
         """Everything between taking the lock and the worker's pid: the batch file and the spawn."""
@@ -460,9 +510,12 @@ class Server:
         finally:
             self._release_quietly(batch_id)
 
-    def _wait(self, cfg, path: Path, doc: dict, batch_id: str, pid: int, log_path: Path, log) -> dict:
+    def _wait(self, cfg, path: Path, doc: dict, batch_id: str, pid: int, log_path: Path, log,
+              notify: Callable[[dict], None] | None = None) -> dict:
         while True:
             current = state.read_json(path)
+            if notify is not None and current is not None:
+                notify(current)
             if current is None or not current.get("finished"):
                 if procs.pid_alive(pid):
                     self.sleep(self.poll_interval)
@@ -566,6 +619,8 @@ class Server:
     def _send(self, reply: dict) -> None:
         data = json.dumps(reply, ensure_ascii=False).encode("utf-8") + b"\n"
         with self._write_mu:
+            if self._out is None:
+                return  # handle() called directly (tests, --selftest): there is no stream
             try:
                 self._out.write(data)
                 self._out.flush()
