@@ -366,7 +366,11 @@ class Server:
             record["cancelled"] = True
             batch_id = record["batch_id"]
         if batch_id is not None:
-            state.request_cancel(self.home, batch_id)
+            self._request_cancel(batch_id)
+
+    def _request_cancel(self, batch_id: str) -> None:
+        print(f"gpu-gate: cancel requested for batch {batch_id}", file=sys.stderr)
+        state.request_cancel(self.home, batch_id)
 
     def _register_batch(self, rid: Any, batch_id: str) -> None:
         with self._mu:
@@ -376,7 +380,7 @@ class Server:
             record["batch_id"] = batch_id
             cancelled = record["cancelled"]
         if cancelled:  # the client cancelled before the batch had an id
-            state.request_cancel(self.home, batch_id)
+            self._request_cancel(batch_id)
 
     # -- batches --
 

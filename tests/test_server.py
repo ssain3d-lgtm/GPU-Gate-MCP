@@ -225,6 +225,25 @@ def test_cancelled_notification_sets_the_flag(home, tmp_path, fake_strata):
     assert replies[0]["result"]["structuredContent"]["jobs"][0]["status"] == "cancelled"
 
 
+def test_cancel_is_logged_on_stderr(server, home, capsys):
+    server._record(7)
+    server._register_batch(7, "20261018-010101-aaaa")
+    server.handle({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7}})
+    assert state.is_cancelled(home, "20261018-010101-aaaa")
+
+    # Cancelled before the batch had an id: the request is passed on (and logged) once it has one.
+    server._record(8)
+    server.handle({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 8}})
+    server._register_batch(8, "20261018-010101-bbbb")
+
+    server.handle({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 99}})
+    err = capsys.readouterr().err.splitlines()
+    assert err == [
+        "gpu-gate: cancel requested for batch 20261018-010101-aaaa",
+        "gpu-gate: cancel requested for batch 20261018-010101-bbbb",
+    ]
+
+
 def test_worker_death_is_reported(server, home, spawn, dead_pid):
     spawn.mode, spawn.pid = "dead", dead_pid
     res = call(server, "comfy_batch", {"jobs": JOBS})
