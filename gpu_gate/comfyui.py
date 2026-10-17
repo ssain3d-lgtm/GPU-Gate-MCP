@@ -33,6 +33,7 @@ SUBMIT_TIMEOUT_S = 30  # ComfyUI validates the whole workflow before it answers 
 FREE_TIMEOUT_S = 30
 OUTPUT_KEYS = ("images", "gifs", "videos", "audio")  # the keys of a history output that hold files
 MAX_ERROR_CHARS = 300  # one node's validation message (a "value not in list" error names every model)
+MIN_REDACT_CHARS = 4  # bat values shorter than this are not hidden in the start log line
 
 Log = Callable[[str], None]
 
@@ -162,6 +163,24 @@ def env_keys(env: dict) -> list[str]:
     return sorted(env)
 
 
+def _redact_argv(argv: list[str], env: dict[str, str]) -> list[str]:
+    """argv for a log line: each value the bat set (`%LM_API%` on the python line expands into argv)
+    is replaced by `<NAME>`. Values shorter than MIN_REDACT_CHARS are left alone, so a flag like
+    `set N=1` does not mangle every `1` in the line. Longer values go first, in case one contains
+    another."""
+    secrets = sorted(
+        ((name, value) for name, value in env.items() if len(value) >= MIN_REDACT_CHARS),
+        key=lambda item: len(item[1]),
+        reverse=True,
+    )
+    shown = []
+    for arg in argv:
+        for name, value in secrets:
+            arg = arg.replace(value, f"<{name}>")
+        shown.append(arg)
+    return shown
+
+
 def _spawn_env(env: dict[str, str]) -> dict[str, str]:
     """The real environment with the bat's variables on top (names compare without case on Windows)."""
     merged = dict(os.environ)
@@ -185,10 +204,11 @@ def start(
     cfg: ComfyCfg, log_path: str, log: Log, bat_override: str | None = None
 ) -> subprocess.Popen:
     """Start ComfyUI detached, its output appended to log_path. The log gets the argv and the names
-    of the env variables set, never their values."""
+    of the env variables set, never their values: a value that reached the argv through `%NAME%`
+    shows as `<NAME>` (the process itself still gets the real argv)."""
     argv, env, cwd = command(cfg, bat_override)
     keys = ", ".join(env_keys(env)) or "none"
-    log(f"comfyui: starting {subprocess.list2cmdline(argv)} (env keys: {keys})")
+    log(f"comfyui: starting {subprocess.list2cmdline(_redact_argv(argv, env))} (env keys: {keys})")
     return procs.spawn_detached(argv, cwd, log_path, env=_spawn_env(env))
 
 

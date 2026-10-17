@@ -234,6 +234,41 @@ def test_start_runs_the_bat_command_with_its_env_and_never_logs_env_values(tmp_p
     assert "secret-value" not in lines[0]
 
 
+def test_start_hides_a_bat_value_that_reached_the_argv_but_still_passes_it_on(tmp_path, lines):
+    (tmp_path / "ComfyUI").mkdir()
+    (tmp_path / "ComfyUI" / "main.py").write_text(
+        "import sys\nprint('ARGV=' + ' '.join(sys.argv[1:]))\n", encoding="utf-8"
+    )
+    bat = tmp_path / "Start ComfyUI.bat"
+    bat.write_text(
+        f'set LM_API=secret-value\r\nset N=1\r\n"{sys.executable}" ComfyUI\\main.py --api-key %LM_API% --n %N%\r\n',
+        encoding="utf-8",
+    )
+    cfg = ComfyCfg(dir=str(tmp_path), bat=bat.name)
+    log_path = tmp_path / "comfy.log"
+
+    argv, _, _ = comfyui.command(cfg)
+    # the process needs the real values; --disable-auto-launch is appended last
+    assert argv[-5:] == ["--api-key", "secret-value", "--n", "1", "--disable-auto-launch"]
+
+    proc = comfyui.start(cfg, str(log_path), lines)
+    assert proc.wait(60) == 0
+
+    assert "ARGV=--api-key secret-value --n 1 --disable-auto-launch" in log_path.read_text(encoding="utf-8")
+    assert len(lines) == 1
+    assert "secret-value" not in lines[0]
+    assert "--api-key <LM_API> --n 1 " in lines[0]  # the 1-character value is not worth hiding
+    assert lines[0].endswith("(env keys: LM_API, N)")
+
+
+def test_redact_argv_replaces_long_bat_values_inside_any_argument():
+    env = {"LM_API": "secret-value", "TOKEN": "secret", "N": "1"}
+    argv = ["py", "--key=secret-value", "--other", "a-secret-b", "--n", "1"]
+    assert comfyui._redact_argv(argv, env) == ["py", "--key=<LM_API>", "--other", "a-<TOKEN>-b", "--n", "1"]
+    assert argv[1] == "--key=secret-value"  # the real argv is not touched
+    assert comfyui._redact_argv(argv, {}) == argv
+
+
 def test_start_passes_bat_override_through_to_command(tmp_path, monkeypatch, lines):
     (tmp_path / "Start Other.bat").write_text("py ComfyUI\\main.py\r\n", encoding="utf-8")
     spawned = []
