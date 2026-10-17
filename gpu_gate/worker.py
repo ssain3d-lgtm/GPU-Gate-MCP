@@ -3,8 +3,10 @@
     0 check the jobs and that no other LLM server is running (`options.force` overrides)
     1 pause Strata (unload its engine)
     2 start the executor (ComfyUI or VoiceStudio), or reuse the one that is already up
-    3 run the jobs
-    4 free and stop the executor
+    3 run the jobs in order, in segments: consecutive workflows are queued together and then waited
+      for one by one; a command runs once every earlier job has finished (VoiceStudio: one run of
+      the batch script for all jobs)
+    4 take unfinished prompts off the queue, free and stop the executor
     5 resume Strata
     6 write the result
 
@@ -300,6 +302,8 @@ class _Run:
         self.resume_needed = False
         self.current: int | None = None  # the index of the job being run
         self.prompts: dict[int, str] = {}  # job index -> ComfyUI prompt id
+        self.finished: set[int] = set()  # jobs whose prompt ComfyUI is done with (or interrupted)
+        self.dropped: set[int] = set()  # jobs whose prompt was taken off the queue
         # the watch (step 3)
         self.watching = False
         self.watch_last = 0.0
@@ -347,7 +351,7 @@ class _Run:
             return default
 
     def _log_vram(self, when: str) -> None:
-        used = self.deps.vram_used()
+        used = self._guarded("VRAM reading", self.deps.vram_used, None)
         self.log(f"worker: VRAM in use {when}: {'unknown' if used is None else f'{used} MiB'}")
 
     # -- the probe handed to every wait in step 3: engine watch + cancel flag --
@@ -366,14 +370,18 @@ class _Run:
         if not self.cancelled and state.is_cancelled(self.home, self.batch_id):
             self.cancelled = True
             self.log("worker: cancel requested")
-            self._delete_pending(self.current or 0)
+            self._drop_prompts(i for i in self.prompts if i >= (self.current or 0))
         return self.cancelled
 
-    def _delete_pending(self, start: int) -> None:
-        """Take the prompts of jobs start.. off ComfyUI's queue (a running one is not affected)."""
-        ids = [self.prompts[i] for i in sorted(self.prompts) if i >= start]
+    def _drop_prompts(self, indices) -> list[str]:
+        """Take the prompts of these jobs off ComfyUI's queue, once each (a prompt that is already
+        running is not affected); the ids sent."""
+        wanted = sorted(i for i in indices if i in self.prompts and i not in self.dropped)
+        ids = [self.prompts[i] for i in wanted]
         if ids:
+            self.dropped.update(wanted)
             self.deps.exec_delete_pending(ids)
+        return ids
 
     # -- steps --
 
@@ -498,19 +506,43 @@ class _Run:
         if self.kind == "voicestudio":
             self._run_voice()
         else:
-            self._submit_workflows()
-            self._run_in_order()
+            self._run_comfy()
 
     def _stop_on_error(self) -> bool:
         return bool(self.options.get("stop_on_error"))
 
-    def _submit_workflows(self) -> None:
-        """Queue every workflow first, so ComfyUI never idles between them."""
+    def _is_workflow(self, i: int) -> bool:
+        job = self.jobs[i]
+        return isinstance(job, dict) and job.get("kind") == "workflow"
+
+    def _run_comfy(self) -> None:
+        """Jobs in order, in segments: a run of consecutive workflows is queued together (so ComfyUI
+        never idles between them) and then waited for in order; any other job (a command) runs on
+        its own once every earlier job has finished. A workflow after a command is queued only after
+        that command is done."""
+        n, i = len(self.jobs), 0
+        while i < n:
+            end = i + 1
+            if self._is_workflow(i):
+                while end < n and self._is_workflow(end):
+                    end += 1
+                if not self.cancelled and self.deps.now() < self.deadline:
+                    self._submit_workflows(range(i, end))
+            for k in range(i, end):
+                if self._run_one(k):
+                    self.log("worker: stop_on_error: skipping the rest")
+                    self._drop_prompts(range(k + 1, end))
+                    self._skip_undecided()
+                    return
+            i = end
+
+    def _submit_workflows(self, indices: range) -> None:
         client_id = f"gpu-gate-{self.batch_id}"
-        for i, (entry, job) in enumerate(zip(self.entries, self.jobs)):
+        for i in indices:
+            entry, job = self.entries[i], self.jobs[i]
             if self._stop_on_error() and any(e["status"] == "error" for e in self.entries[:i]):
                 return  # these jobs will be skipped: do not queue them
-            if entry["status"] is not None or job.get("kind") != "workflow":
+            if entry["status"] is not None:
                 continue
             try:
                 workflow = self.deps.exec_load_workflow(job["path"])
@@ -524,36 +556,35 @@ class _Run:
                 continue
             self.log(f"worker: queued {entry['name']} as {self.prompts[i]}")
 
-    def _run_in_order(self) -> None:
-        for i, (entry, job) in enumerate(zip(self.entries, self.jobs)):
-            if entry["status"] is None:
-                if self.cancelled:
-                    entry["status"] = "cancelled"
-                    continue
-                remaining = self.deadline - self.deps.now()
-                if remaining <= 0:
-                    entry.update(status="timeout", error="batch timeout")
-                    continue
+    def _run_one(self, i: int) -> bool:
+        """Wait for job i's prompt or run its command, unless it is already decided, cancelled or
+        out of time. True when the batch must stop here (an error under stop_on_error)."""
+        entry, job = self.entries[i], self.jobs[i]
+        if entry["status"] is None:
+            remaining = self.deadline - self.deps.now()
+            if self.cancelled:
+                entry["status"] = "cancelled"
+            elif remaining <= 0:
+                entry.update(status="timeout", error="batch timeout")
+            else:
                 self.current = i
                 self._save(entry["name"])
-                if job.get("kind") == "workflow":
+                if self._is_workflow(i):
                     self._wait_workflow(i, entry, remaining)
                 else:
                     self._run_command(entry, job, remaining)
                 self.current = None
                 self.log(f"worker: {entry['name']}: {entry['status']}" + (f" ({entry['error']})" if entry["error"] else ""))
                 self._save()
-            if entry["status"] == "error" and self._stop_on_error():
-                self.log("worker: stop_on_error: skipping the rest")
-                self._delete_pending(i + 1)
-                self._skip_undecided()
-                return
+        return entry["status"] == "error" and self._stop_on_error()
 
     def _wait_workflow(self, i: int, entry: dict, remaining: float) -> None:
         answer = self.deps.exec_wait(
             self.prompts[i], min(self.job_timeout, remaining), self.probe, alive=self._alive()
         )
         status = answer.get("status")
+        if status in ("done", "error", "cancelled"):  # a timeout leaves the prompt in ComfyUI
+            self.finished.add(i)
         if status == "timeout" and not answer.get("error"):
             why = "batch timeout" if remaining < self.job_timeout else f"job timeout ({self.job_timeout} s)"
             answer = {**answer, "error": why}
@@ -608,8 +639,21 @@ class _Run:
         executor = self.result["executor"]
         if not self.executor_up:
             return
+        keep = bool(self.options.get("keep_executor")) and not executor["started_by_gate"]
+        # Prompts left by a timeout, stop_on_error or an exception must not go on running (in a
+        # kept executor) while Strata loads again: take the queued ones off the queue first.
+        unfinished = [i for i in self.prompts if i not in self.finished and i not in self.dropped]
+        self._guarded("queue cleanup", lambda: self._drop_prompts(unfinished), [])
+        if keep and unfinished:
+            # The adapter has no interrupt of its own outside a wait (and /interrupt is not scoped
+            # to a prompt, so it could stop the user's own work in a kept ComfyUI).
+            running = [self.prompts[i] for i in unfinished]
+            self.warnings.append(
+                f"kept {self.kind}: unfinished prompts {running} were taken off the queue; "
+                "one that had already started may still be running"
+            )
         self._guarded(f"{self.kind} free", self.deps.exec_free, False)
-        if self.options.get("keep_executor") and not executor["started_by_gate"]:
+        if keep:
             self.log(f"worker: keep_executor: leaving the running {self.kind} up")
             return
         stopped = self._guarded(
@@ -674,32 +718,42 @@ def _release_own_lock(home: Path, batch_id: str) -> None:
         state.release_lock(home)
 
 
+def _write_failure(home: Path, batch: dict, message: str) -> None:
+    """A failed result made of the message alone, unless the batch file already holds a real one
+    (run_batch got as far as writing it): that one has the job results and the restore status."""
+    written = state.read_json(state.batch_path(home, batch["batch_id"]))
+    if written is not None and isinstance(written.get("result"), dict):
+        return
+    result = _skeleton(home, batch)
+    result["error"] = _one_line(message)
+    _write_final(home, dict(batch), result)
+
+
 def main(batch_path: str) -> int:
-    """Run the batch file at batch_path; 0 when the batch is ok, else 1."""
-    batch = state.read_json(batch_path)
-    if batch is None or not isinstance(batch.get("batch_id"), str):
-        print(f"gpu-gate worker: not a batch file: {batch_path}", file=sys.stderr)
-        return 1
+    """Run the batch file at batch_path; 0 when the batch is ok, else 1. The lock is released
+    (when it is this batch's) however the run ends."""
     home = state.home()
-    batch_id = batch["batch_id"]
-    log = _file_log(state.log_path(home, batch_id))
+    batch = state.read_json(batch_path)
+    batch_id = batch.get("batch_id") if batch is not None else None
+    if not isinstance(batch_id, str):
+        batch_id = Path(batch_path).stem  # the server names batch files <batch_id>.json
     try:
+        if batch is None or not isinstance(batch.get("batch_id"), str):
+            print(f"gpu-gate worker: not a batch file: {batch_path}", file=sys.stderr)
+            return 1
+        log = _file_log(state.log_path(home, batch_id))
         try:
             cfg = config.load(home)
             deps = default_deps(cfg, batch.get("kind") or "comfyui")
         except (config.ConfigError, ValueError) as err:
             log(f"worker: {err}")
-            result = _skeleton(home, batch)
-            result["error"] = _one_line(str(err))
-            _write_final(home, dict(batch), result)
+            _write_failure(home, batch, str(err))
             return 1
         try:
             result = run_batch(home, batch, cfg, deps, log)
         except Exception as err:
             log(f"worker: batch failed\n{traceback.format_exc()}")
-            result = _skeleton(home, batch)
-            result["error"] = _describe(err)
-            _write_final(home, dict(batch), result)
+            _write_failure(home, batch, _describe(err))
             return 1
         return 0 if result["ok"] else 1
     finally:

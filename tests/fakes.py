@@ -368,7 +368,8 @@ def fake_deps(
     start_error: exec_start raises it. cold_start_s: what exec_wait_ready returns (None = never ready).
     load_errors: {workflow basename: exception} for exec_load_workflow. submit_error: every
         exec_submit raises it.
-    waits: exec_wait answers in call order (a status string or a dict; default "done").
+    waits: exec_wait answers in call order (a status string or a dict; default "done"; an exception
+        instance is raised instead).
     wait_advance: each exec_wait first advances the clock this far, then asks its `cancelled` probe,
         and answers "cancelled" when the probe says so (like the real wait's poll).
     on_wait(i): called after the i-th exec_wait has decided its answer.
@@ -428,10 +429,13 @@ def fake_deps(
         counters["wait"] += 1
         if wait_advance:
             clock.sleep(wait_advance)
+        item = waits[i] if i < len(waits) else "done"
+        if isinstance(item, BaseException):
+            raise item
         if cancelled():
             answer = _wait_result("cancelled", prompt_id)
         else:
-            answer = _wait_result(waits[i] if i < len(waits) else "done", prompt_id)
+            answer = _wait_result(item, prompt_id)
         if on_wait is not None:
             on_wait(i)
         return answer

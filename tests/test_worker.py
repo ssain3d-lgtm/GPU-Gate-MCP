@@ -375,6 +375,91 @@ def test_main_leaves_another_batchs_lock_alone(home, wf, tmp_path, monkeypatch):
     assert state.read_json(state.paths(home).lock)["batch_id"] == "other"
 
 
+def test_kept_executor_gets_unfinished_prompts_off_the_queue(home, cfg, log, wf):
+    # The batch runs out of time: the first prompt timed out (still in ComfyUI), the other two were
+    # never waited for. The kept ComfyUI must not go on with them while Strata loads again.
+    deps = fake_deps(comfy_running=True, wait_advance=100, waits=["timeout"])
+    jobs = [wf("a.json"), wf("b.json"), wf("c.json")]
+    r = worker.run_batch(home, batch(jobs, {"keep_executor": True, "batch_timeout_s": 50}), cfg, deps, log)
+    assert [j["status"] for j in r["jobs"]] == ["timeout", "timeout", "timeout"]
+    assert calls_to(deps, "exec_delete_pending") == [("exec_delete_pending", (["p1", "p2", "p3"],), {})]
+    assert names(deps).index("exec_delete_pending") < names(deps).index("exec_free")
+    assert "exec_stop" not in names(deps) and "strata_resume" in names(deps)
+    assert any("taken off the queue" in w for w in r["warnings"])
+
+
+def test_mixed_jobs_run_in_segments(home, cfg, log, wf, tmp_path):
+    steps = ("exec_submit", "exec_wait", "run_command")
+    command = {"kind": "command", "command": ["python", "post.py"], "cwd": str(tmp_path)}
+    deps = fake_deps()
+    r = worker.run_batch(home, batch([wf("a.json"), command, wf("b.json")]), cfg, deps, log)
+    assert [n for n in names(deps) if n in steps] == ["exec_submit", "exec_wait", "run_command", "exec_submit", "exec_wait"]
+    assert r["ok"]
+
+    deps = fake_deps()
+    worker.run_batch(home, batch([wf("a.json"), wf("b.json")]), cfg, deps, log)
+    assert [n for n in names(deps) if n in steps] == ["exec_submit", "exec_submit", "exec_wait", "exec_wait"]
+
+
+def test_vram_reading_failure_keeps_the_results(home, wf, tmp_path, monkeypatch):
+    _write_config(home, tmp_path)
+
+    def broken_gauge():
+        raise RuntimeError("nvidia-smi exploded")
+
+    def deps_with_a_broken_gauge(cfg, kind):
+        deps = fake_deps()
+        deps.vram_used = broken_gauge
+        return deps
+
+    monkeypatch.setattr(worker, "default_deps", deps_with_a_broken_gauge)
+    b = batch([wf("a.json")])
+    path = state.batch_path(home, b["batch_id"])
+    state.write_json(path, b)
+    assert worker.main(str(path)) == 0
+    result = state.read_json(path)["result"]
+    assert [j["status"] for j in result["jobs"]] == ["done"] and result["strata"]["restored"] is True
+    assert any("VRAM reading failed" in w for w in result["warnings"])
+
+    # An exception after run_batch wrote its result must not replace it with a bare failure.
+    real_run_batch = worker.run_batch
+
+    def run_then_fail(*args):
+        real_run_batch(*args)
+        raise RuntimeError("late failure")
+
+    monkeypatch.setattr(worker, "run_batch", run_then_fail)
+    b = batch([wf("b.json")])
+    path = state.batch_path(home, b["batch_id"])
+    state.write_json(path, b)
+    assert worker.main(str(path)) == 1
+    result = state.read_json(path)["result"]
+    assert [j["status"] for j in result["jobs"]] == ["done"] and result["strata"]["restored"] is True
+
+
+def test_unreadable_batch_file_still_releases_the_lock(home):
+    batch_id = "20261017-120000-abcd"
+    path = state.batch_path(home, batch_id)
+    path.write_text("{not json", encoding="utf-8")
+    state.write_lock(home, batch_id, 1)
+    assert worker.main(str(path)) == 1
+    assert state.read_json(state.paths(home).lock) is None
+
+
+def test_keyboard_interrupt_still_stops_and_resumes(home, wf, tmp_path, monkeypatch):
+    _write_config(home, tmp_path)
+    deps = fake_deps(waits=[KeyboardInterrupt()])
+    monkeypatch.setattr(worker, "default_deps", lambda cfg, kind: deps)
+    b = batch([wf("a.json")])
+    path = state.batch_path(home, b["batch_id"])
+    state.write_json(path, b)
+    with pytest.raises(KeyboardInterrupt):
+        worker.main(str(path))
+    assert "exec_stop" in names(deps) and "strata_resume" in names(deps)
+    assert names(deps).index("exec_stop") < names(deps).index("strata_resume")
+    assert state.read_json(state.paths(home).lock) is None
+
+
 def test_default_deps_binds_the_adapters_by_kind(cfg):
     d = worker.default_deps(cfg, "comfyui")
     assert d.strata_health.func is strata.health and d.strata_health.args == (cfg.strata,)
