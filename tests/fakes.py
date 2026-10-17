@@ -8,6 +8,7 @@ implements handle(method, path, body) -> (status, payload).
 from __future__ import annotations
 
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -310,3 +311,177 @@ class FakeVoice(FakeServer):
         if method == "GET" and path.split("?", 1)[0] == "/health":
             return 200, {"status": self.status}
         return super().handle(method, path, body)
+
+
+# --- worker deps -------------------------------------------------------------------------------
+
+
+class FakeProc:
+    """Stands in for the executor's Popen: a pid and a poll() that says it is still running."""
+
+    def __init__(self, pid: int = 4242, code: int | None = None) -> None:
+        self.pid = pid
+        self.code = code
+
+    def poll(self) -> int | None:
+        return self.code
+
+
+# Not steps, so not recorded: the clock, the VRAM gauge and reading a workflow file.
+UNRECORDED = ("now", "sleep", "vram_used", "exec_load_workflow")
+
+
+def _wait_result(item, prompt_id: str) -> dict:
+    """A scripted exec_wait answer: a status string ("done" gets one output file) or a full dict."""
+    if isinstance(item, dict):
+        return {"seconds": 5.0, "outputs": [], "error": None, **item}
+    outputs = [f"out/{prompt_id}.png"] if item == "done" else []
+    return {"status": item, "seconds": 5.0, "outputs": outputs, "error": None}
+
+
+def fake_deps(
+    clock: FakeClock | None = None,
+    *,
+    other_llm=(),
+    strata_loaded: bool = True,
+    health=None,
+    pause: dict | None = None,
+    resume: dict | None = None,
+    comfy_running: bool = False,
+    start_error: Exception | None = None,
+    cold_start_s: float | None = 12.0,
+    load_errors: dict | None = None,
+    submit_error: Exception | None = None,
+    waits=(),
+    wait_advance: float = 0.0,
+    on_wait=None,
+    commands=(),
+    stop: dict | None = None,
+):
+    """A worker.Deps whose callables record (name, args, kwargs) into deps.calls and answer from a script.
+
+    other_llm: the ports other_llm_alive reports. strata_loaded: the engine's state before the batch;
+    without `health`, strata_health reports it and pause/resume change it like the real server.
+    health: a list of strata_health answers in call order (the last one repeats).
+    pause / resume: the adapters' answers (default: unloaded / loaded after 30 s).
+    comfy_running: exec_ready answers True (an executor someone else started).
+    start_error: exec_start raises it. cold_start_s: what exec_wait_ready returns (None = never ready).
+    load_errors: {workflow basename: exception} for exec_load_workflow. submit_error: every
+        exec_submit raises it.
+    waits: exec_wait answers in call order (a status string or a dict; default "done").
+    wait_advance: each exec_wait first advances the clock this far, then asks its `cancelled` probe,
+        and answers "cancelled" when the probe says so (like the real wait's poll).
+    on_wait(i): called after the i-th exec_wait has decided its answer.
+    commands: (returncode, seconds) answers of run_command in call order (default (0, 1.0)).
+    stop: exec_stop's answer (default: stopped, the pid of the proc it was given, else 5151).
+    The clock (deps.clock) only moves when wait_advance asks it to.
+    """
+    from gpu_gate import worker  # here, so the adapter tests import this file without the worker
+
+    clock = clock or FakeClock()
+    calls: list = []
+    engine = {"loaded": strata_loaded}
+    counters = {"health": 0, "submit": 0, "wait": 0, "command": 0}
+
+    def strata_health():
+        if health is None:
+            return {"status": "ok", "loaded": engine["loaded"]}
+        answer = health[min(counters["health"], len(health) - 1)]
+        counters["health"] += 1
+        return answer
+
+    def strata_pause(log):
+        answer = pause or {
+            "status": "unloaded" if engine["loaded"] else "not loaded",
+            "paused_s": 3.0,
+            "tries": 1,
+        }
+        if answer["status"] in ("unloaded", "not loaded"):
+            engine["loaded"] = False
+        return answer
+
+    def strata_resume(log):
+        answer = resume or {"restored": True, "load_s": 30.0, "error": None, "already_loaded": False}
+        if answer.get("restored"):
+            engine["loaded"] = True
+        return answer
+
+    def exec_start(log_path, log, bat_override=None):
+        if start_error is not None:
+            raise start_error
+        return FakeProc()
+
+    def exec_load_workflow(path):
+        error = (load_errors or {}).get(os.path.basename(path))
+        if error is not None:
+            raise error
+        return {"1": {"class_type": "SaveImage", "inputs": {}}}
+
+    def exec_submit(workflow, client_id):
+        if submit_error is not None:
+            raise submit_error
+        counters["submit"] += 1
+        return f"p{counters['submit']}"
+
+    def exec_wait(prompt_id, timeout_s, cancelled, alive=None):
+        i = counters["wait"]
+        counters["wait"] += 1
+        if wait_advance:
+            clock.sleep(wait_advance)
+        if cancelled():
+            answer = _wait_result("cancelled", prompt_id)
+        else:
+            answer = _wait_result(waits[i] if i < len(waits) else "done", prompt_id)
+        if on_wait is not None:
+            on_wait(i)
+        return answer
+
+    def run_command(argv, cwd, timeout_s, cancelled, log_path):
+        i = counters["command"]
+        counters["command"] += 1
+        return commands[i] if i < len(commands) else (0, 1.0)
+
+    def exec_stop(proc, log):
+        return stop or {"stopped": True, "pids": [proc.pid if proc is not None else 5151]}
+
+    def voice_run_batch(jobs, work_dir, timeout_s, cancelled, log):
+        return [
+            {"index": i, "status": "done", "seconds": 2.0, "outputs": [job["out"]], "error": None}
+            for i, job in enumerate(jobs)
+        ]
+
+    script = {
+        "strata_health": strata_health,
+        "strata_pause": strata_pause,
+        "strata_resume": strata_resume,
+        "exec_ready": lambda: comfy_running,
+        "exec_start": exec_start,
+        "exec_wait_ready": lambda proc, timeout_s: cold_start_s,
+        "exec_submit": exec_submit,
+        "exec_wait": exec_wait,
+        "exec_free": lambda: True,
+        "exec_stop": exec_stop,
+        "exec_load_workflow": exec_load_workflow,
+        "exec_delete_pending": lambda prompt_ids: True,
+        "voice_run_batch": voice_run_batch,
+        "run_command": run_command,
+        "vram_used": lambda: 1000,
+        "pid_vram_gone": lambda pid, timeout_s: True,
+        "other_llm_alive": lambda ports: list(other_llm),
+        "now": clock.now,
+        "sleep": clock.sleep,
+    }
+
+    def recorded(name, fn):
+        def call(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return fn(*args, **kwargs)
+
+        return call
+
+    deps = worker.Deps(
+        **{name: fn if name in UNRECORDED else recorded(name, fn) for name, fn in script.items()}
+    )
+    deps.calls = calls
+    deps.clock = clock
+    return deps
