@@ -13,8 +13,9 @@ def test_process_vram_parses_counter_lines(monkeypatch):
     monkeypatch.setattr(
         gpu.procs, "process_name", lambda pid: {12356: "python", 2596: "dwm"}.get(pid)
     )
+    # 12356 holds 17667000000 + 1000000 bytes: 17,668,000,000 // 1,048,576 = 16849 (bytes are added before flooring)
     assert gpu.process_vram() == [
-        {"pid": 12356, "name": "python", "vram_mb": 16848},
+        {"pid": 12356, "name": "python", "vram_mb": 16849},
         {"pid": 2596, "name": "dwm", "vram_mb": 7915},
     ]
 

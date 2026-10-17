@@ -55,24 +55,20 @@ def process_vram(run: Callable[[], str] | None = None) -> list[dict] | None:
     """Processes holding at least 300 MiB of dedicated VRAM, biggest first.
 
     Each entry is {"pid": int, "name": str | None, "vram_mb": int}. One process shows up as several
-    counter instances (one per adapter and engine), which are added together: the 300 MiB cut-off
-    is applied to the exact byte total, while vram_mb adds up the instances after each was cut to
-    whole MiB (at most one MiB short per extra instance). None when the counter text is empty or
-    has no line that can be read.
+    counter instances (one per adapter and engine); their bytes are added together and the total is
+    cut to whole MiB once. None when the counter text is empty or has no line that can be read.
     """
     text = (run or _run_counter)()
     used_bytes: dict[int, int] = {}
-    used_mib: dict[int, int] = {}
     for line in text.splitlines():
         match = _COUNTER_LINE.match(line.strip())
         if match:
-            pid, size = int(match.group(1)), int(match.group(2))
-            used_bytes[pid] = used_bytes.get(pid, 0) + size
-            used_mib[pid] = used_mib.get(pid, 0) + size // 2**20
+            pid = int(match.group(1))
+            used_bytes[pid] = used_bytes.get(pid, 0) + int(match.group(2))
     if not used_bytes:
         return None
     found = [
-        {"pid": pid, "name": procs.process_name(pid), "vram_mb": used_mib[pid]}
+        {"pid": pid, "name": procs.process_name(pid), "vram_mb": size // 2**20}
         for pid, size in used_bytes.items()
         if size >= MIN_PROCESS_MIB * 2**20
     ]
