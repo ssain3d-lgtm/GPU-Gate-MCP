@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from fakes import FakeStrata
+from fakes import FakeClock, FakeStrata
 from gpu_gate import config, state
 from gpu_gate.config import ComfyCfg, Config, Limits, StrataCfg, VoiceCfg
 from gpu_gate.server import Server, worker_argv
@@ -359,27 +359,27 @@ def test_serve_returns_promptly_when_stdin_closes_during_a_batch(home, tmp_path,
 JOBS3 = [{"kind": "workflow", "path": f"/tmp/{name}.json"} for name in ("a", "b", "c")]
 
 
-def serve_a_batch(home, tmp_path, fake_strata, meta=None, polls=3):
-    """Serve one comfy_batch call whose (fake) worker moves one job a poll and finishes after
-    `polls` polls; the stdout messages in order."""
+def serve_a_batch(home, tmp_path, fake_strata, meta=None, seconds=40):
+    """Serve one comfy_batch call on a fake clock: the server polls every 2 s, the (fake) worker
+    decides one job every 10 s and finishes once `seconds` have passed; the stdout messages in order."""
     _, strata_cfg = fake_strata
     cfg = make_cfg(tmp_path, strata_cfg)
     spawn = FakeSpawn(mode="live")
     finished = threading.Event()
-    seen = []
+    clock = FakeClock()
 
-    def sleep(seconds):
-        seen.append(seconds)
+    def sleep(step):
+        clock.sleep(step)
         path = spawn.paths[0]
         doc = state.read_json(path)
-        done = len(seen)
+        done = min(3, int(clock.t // 10))
         doc.update(state="running", progress={"done": done, "total": 3, "current": f"job {done}"})
         state.write_json(path, doc)
-        if done >= polls:
+        if clock.t >= seconds:
             finish_batch(path)
             finished.set()
 
-    server = Server(home, lambda: cfg, spawn, poll_interval=0.01, sleep=sleep)
+    server = Server(home, lambda: cfg, spawn, poll_interval=2.0, sleep=sleep, now=clock.now)
     params = {"name": "comfy_batch", "arguments": {"jobs": JOBS3}}
     if meta is not None:
         params["_meta"] = meta
@@ -395,36 +395,42 @@ def serve_a_batch(home, tmp_path, fake_strata, meta=None, polls=3):
 
 
 @pytest.mark.parametrize("token", ["tok-1", 42])
-def test_progress_notifications_carry_the_token_until_the_result(home, tmp_path, fake_strata, token):
-    messages = serve_a_batch(home, tmp_path, fake_strata, meta={"progressToken": token})
+def test_progress_notifications_every_15_s_with_an_increasing_counter(home, tmp_path, fake_strata, token):
+    messages = serve_a_batch(home, tmp_path, fake_strata, meta={"progressToken": token}, seconds=40)
     reply = next(i for i, m in enumerate(messages) if m.get("id") == 11)
     assert reply == len(messages) - 1  # the result comes last
     progress = [m for m in messages[:reply] if m.get("method") == "notifications/progress"]
-    assert len(progress) >= 3 and len(progress) == reply
+    assert len(progress) == 2 and len(progress) == reply  # after 15 s and after 30 s of polling
     for m in progress:
         assert m["jsonrpc"] == "2.0" and "id" not in m
         assert m["params"]["progressToken"] == token
-        assert m["params"]["total"] == 3
+        assert "total" not in m["params"]
         assert len(m["params"]["message"]) <= 120
     values = [m["params"]["progress"] for m in progress]
-    assert values == sorted(values) and values[0] == 0
-    assert progress[1]["params"]["message"] == "running 1/3 job 1"
+    assert values == [1, 2]  # strictly increasing: the number of notifications sent so far
+    assert progress[0]["params"]["message"] == "running 1/3 job 1"  # read at 16 s
+    assert progress[1]["params"]["message"] == "running 3/3 job 3"  # read at 32 s
     assert messages[reply]["result"]["isError"] is False
+
+
+def test_a_short_batch_sends_no_progress(home, tmp_path, fake_strata):
+    messages = serve_a_batch(home, tmp_path, fake_strata, meta={"progressToken": "t"}, seconds=10)
+    assert [m.get("id") for m in messages] == [11]
 
 
 @pytest.mark.parametrize("meta", [None, {}, {"progressToken": True}, {"progressToken": [1]}])
 def test_no_progress_notifications_without_a_token(home, tmp_path, fake_strata, meta):
-    messages = serve_a_batch(home, tmp_path, fake_strata, meta=meta)
+    messages = serve_a_batch(home, tmp_path, fake_strata, meta=meta, seconds=40)
     assert [m.get("id") for m in messages] == [11]
     assert not any(m.get("method") == "notifications/progress" for m in messages)
 
 
-def test_progress_message_is_short_and_total_is_optional():
+def test_progress_message_is_short_and_has_no_total():
     from gpu_gate.server import progress_params
-    p = progress_params("t", {"state": "running", "progress": {"done": 1, "total": None, "current": "x" * 300}})
-    assert p == {"progressToken": "t", "progress": 1, "message": p["message"]}
+    p = progress_params("t", {"state": "running", "progress": {"done": 1, "total": None, "current": "x" * 300}}, 5)
+    assert p == {"progressToken": "t", "progress": 5, "message": p["message"]}
     assert len(p["message"]) <= 120 and p["message"].startswith("running 1/? x")
-    assert progress_params("t", {"state": "pending"}) == {"progressToken": "t", "progress": 0, "message": "pending 0/?"}
+    assert progress_params("t", {"state": "pending"}, 1) == {"progressToken": "t", "progress": 1, "message": "pending 0/?"}
 
 
 def test_lock_is_released_when_the_spawn_fails_and_the_disk_does_too(server, home, spawn, monkeypatch):

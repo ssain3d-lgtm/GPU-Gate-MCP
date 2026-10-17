@@ -2,9 +2,10 @@
 
 `comfy_batch` / `voice_batch` write a batch file, start the detached worker on it and read the file
 every `poll_interval` seconds until the worker writes `finished`; the call blocks for the whole batch.
-When the request carries `params._meta.progressToken`, every read of the batch file also sends a
-`notifications/progress` (decided jobs / all jobs), which keeps a client's idle timer from ending
-the call.
+When the request carries `params._meta.progressToken`, a read of the batch file also sends a
+`notifications/progress` at most every PROGRESS_INTERVAL_S seconds (the first after that long), which
+keeps a client's idle timer from ending the call; `progress` counts the notifications, the message
+holds the batch's state and job counts.
 `gate_status` is a read-only snapshot of the state directory and the servers. stdout carries only
 protocol lines; diagnostics go to stderr.
 
@@ -28,6 +29,7 @@ EOF_GRACE_S = 1.0  # at end of input, how long calls in progress get to write th
 WARN_VRAM_MB = 300  # another process holding this much while the LLM is loaded is worth a warning
 WARN_DWM_MB = 3072  # the desktop compositor always holds some; only a lot of it is worth one
 MAX_PROGRESS_CHARS = 120  # the message of a progress notification
+PROGRESS_INTERVAL_S = 15  # at most one progress notification this often (the first after 15 s)
 LAUNCHER = Path(__file__).resolve().parent.parent / "gpu_gate_server.py"
 
 INSTRUCTIONS = (
@@ -219,20 +221,18 @@ def _count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
-def progress_params(token: str | int, doc: dict) -> dict:
-    """The params of a notifications/progress for the batch file doc: progress is the number of
-    decided jobs, total the number of jobs (left out when unknown), message
-    "<state> <done>/<total> <current job>" in at most MAX_PROGRESS_CHARS characters."""
+def progress_params(token: str | int, doc: dict, count: int) -> dict:
+    """The params of the count-th notifications/progress for the batch file doc.
+
+    MCP wants `progress` to increase with every notification, and a job can run for an hour, so
+    progress is count (1, 2, 3, ... per call) and there is no total. The job counts go into the
+    message, "<state> <done>/<total> <current job>", in at most MAX_PROGRESS_CHARS characters."""
     progress = doc.get("progress") if isinstance(doc.get("progress"), dict) else {}
     done = _count(progress.get("done")) or 0
     total = _count(progress.get("total"))
     current = progress.get("current") or ""
     message = _one_line(f"{doc.get('state') or 'pending'} {done}/{'?' if total is None else total} {current}")
-    params: dict = {"progressToken": token, "progress": done}
-    if total is not None:
-        params["total"] = total
-    params["message"] = message[:MAX_PROGRESS_CHARS]
-    return params
+    return {"progressToken": token, "progress": count, "message": message[:MAX_PROGRESS_CHARS]}
 
 
 def _tool_result(res: dict, is_error: bool) -> dict:
@@ -255,12 +255,14 @@ class Server:
         poll_interval: float = 2.0,
         sleep: Callable[[float], None] = time.sleep,
         process_vram: Callable[[], list | None] = gpu.process_vram,
+        now: Callable[[], float] = time.monotonic,
     ):
         self.home = Path(home)
         self.cfg_loader = cfg_loader
         self.spawn_worker = spawn_worker
         self.poll_interval = poll_interval
         self.sleep = sleep
+        self.now = now  # paces the progress notifications
         self.process_vram = process_vram
         self._mu = threading.Lock()  # guards _running
         # request id of a tools/call in progress -> {"batch_id", "pid", "cancelled"}
@@ -433,14 +435,16 @@ class Server:
         that timer. Nothing is sent once the request is cancelled."""
         if token is None:
             return None
+        sent = [0]
 
         def notify(doc: dict) -> None:
             with self._mu:
                 record = self._running.get(rid)
                 if record is None or record["cancelled"]:
                     return
+            sent[0] += 1
             self._send({"jsonrpc": "2.0", "method": "notifications/progress",
-                        "params": progress_params(token, doc)})
+                        "params": progress_params(token, doc, sent[0])})
 
         return notify
 
@@ -516,10 +520,12 @@ class Server:
 
     def _wait(self, cfg, path: Path, doc: dict, batch_id: str, pid: int, log_path: Path, log,
               notify: Callable[[dict], None] | None = None) -> dict:
+        next_progress = self.now() + PROGRESS_INTERVAL_S
         while True:
             current = state.read_json(path)
-            if notify is not None and current is not None:
+            if notify is not None and current is not None and self.now() >= next_progress:
                 notify(current)
+                next_progress = self.now() + PROGRESS_INTERVAL_S
             if current is None or not current.get("finished"):
                 if procs.pid_alive(pid):
                     self.sleep(self.poll_interval)

@@ -270,7 +270,7 @@ ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경�
 - **LLM 과 GPU 작업은 동시에 못 돌린다.** 한 장의 GPU 에서는 그렇다. 배치 중에는 LLM 이 응답하지 못한다(그 사이 대화를 시작하면 경고만 남고 배치는 계속 간다).
 - **다른 LLM 서버는 막는다.** `other_llm_ports` 의 서버가 응답하면 `force` 가 아닌 한 배치를 거부한다. 게이트는 Strata 만 내리고 올린다.
 - **한 번에 배치 하나.** 다른 클라이언트에서 부르면 `busy`.
-- **진행 알림은 토큰이 있을 때만.** 클라이언트가 호출에 progress 토큰(`params._meta.progressToken`)을 실어 보내면, 서버는 배치를 기다리는 동안 배치 파일을 읽을 때마다 `notifications/progress`(끝난 잡 수/전체 잡 수)를 보낸다. 토큰이 없으면 보내지 않는다. 그래도 클라이언트의 도구 타임아웃(그리고 Qwen Code 의 무응답 타이머, Hermes 의 도구 마감 시간)이 배치보다 짧으면 클라이언트가 호출을 끊고 취소를 보낸다. 클라이언트별 설정은 [docs/clients.md](docs/clients.md).
+- **진행 알림은 토큰이 있을 때만.** 클라이언트가 호출에 progress 토큰(`params._meta.progressToken`)을 실어 보내면, 서버는 배치를 기다리는 동안 15초마다(첫 알림은 15초 뒤) `notifications/progress` 를 보낸다. `progress` 는 매번 커지는 알림 번호이고 `total` 은 없으며, 상태와 끝난 잡 수/전체 잡 수는 `message` 에 있다. 토큰이 없으면 보내지 않는다. 그래도 클라이언트의 도구 타임아웃(그리고 Qwen Code 의 무응답 타이머, Hermes 의 도구 마감 시간)이 배치보다 짧으면 클라이언트가 호출을 끊고 취소를 보낸다. 클라이언트별 설정은 [docs/clients.md](docs/clients.md).
 - **Windows 우선.** Windows 에서만 검증했다. POSIX 분기(프로세스 종료, 포트 조회)는 있으나 확인하지 않았고, GPU 프로세스별 VRAM 조회는 Windows 성능 카운터에 기댄다.
 - **시작 `.bat` 해석은 단순하다.** `set` 줄과 `main.py` 실행 줄만 이해한다. 그 이상이 필요하면 `comfyui.command`.
 - **`voice_batch` 는 잡별 시간·부분 결과가 없다.** 시간 초과나 취소면 일부 파일이 이미 쓰였어도 모든 잡의 `outputs` 가 비어 있다.
