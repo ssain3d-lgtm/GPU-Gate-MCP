@@ -20,6 +20,7 @@ import os
 import secrets
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +32,11 @@ ENV_HOME = "GPU_GATE_HOME"
 # Batch states that mean the batch is over; a stale lock must not rewrite these.
 FINISHED_STATES = ("done", "failed", "aborted")
 
-_IDLE_STATE = {"state": "idle", "batch_id": None, "updated": None, "last_result": None}
+# An external UI polling a file can hold it open while we replace it; retry briefly.
+_REPLACE_TRIES = 10
+_REPLACE_PAUSE_SECONDS = 0.05
+
+_IDLE_STATE ={"state": "idle", "batch_id": None, "updated": None, "last_result": None}
 
 
 @dataclass(frozen=True)
@@ -92,8 +97,21 @@ def read_json(path: Path | str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _replace_with_retry(src: str, dst: Path) -> None:
+    """os.replace, retrying while a reader holds dst open (Windows sharing violation)."""
+    for attempt in range(_REPLACE_TRIES):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as err:
+            sharing = isinstance(err, PermissionError) or getattr(err, "winerror", None) in (5, 32)
+            if not sharing or attempt == _REPLACE_TRIES - 1:
+                raise
+            time.sleep(_REPLACE_PAUSE_SECONDS)
+
+
 def write_json(path: Path | str, data: dict) -> None:
-    """Atomically replace path with data: write a sibling temp file, then os.replace."""
+    """Atomically replace path with data: write a unique sibling temp file, then os.replace."""
     target = Path(path)
     text = json.dumps(data, ensure_ascii=False, indent=2)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -101,7 +119,7 @@ def write_json(path: Path | str, data: dict) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
-        os.replace(tmp, target)
+        _replace_with_retry(tmp, target)
     except BaseException:
         try:
             os.unlink(tmp)

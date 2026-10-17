@@ -1,3 +1,4 @@
+import errno
 import os
 import subprocess
 import sys
@@ -62,6 +63,58 @@ def test_write_json_is_atomic_and_round_trips(tmp_path):
         state.write_json(path, {"bad": object()})
     assert state.read_json(path) == data
     assert [p.name for p in tmp_path.iterdir()] == ["x.json"]
+
+
+def test_write_json_retries_replace_while_a_reader_holds_the_file(tmp_path, monkeypatch):
+    path = tmp_path / "x.json"
+    real_replace = os.replace
+    calls = []
+
+    def flaky_replace(src, dst):
+        calls.append((src, dst))
+        if len(calls) <= 2:
+            raise PermissionError(13, "sharing violation")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(state.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    state.write_json(path, {"a": 1})
+    assert len(calls) == 3
+    assert state.read_json(path) == {"a": 1}
+    assert [p.name for p in tmp_path.iterdir()] == ["x.json"]
+
+
+def test_write_json_raises_after_the_last_failed_replace_and_leaves_no_temp_file(tmp_path, monkeypatch):
+    path = tmp_path / "x.json"
+    state.write_json(path, {"old": True})
+    calls = []
+
+    def locked_replace(src, dst):
+        calls.append(src)
+        raise PermissionError(13, "sharing violation")
+
+    monkeypatch.setattr(state.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(os, "replace", locked_replace)
+    with pytest.raises(PermissionError):
+        state.write_json(path, {"new": True})
+    assert len(calls) == 10
+    assert state.read_json(path) == {"old": True}
+    assert [p.name for p in tmp_path.iterdir()] == ["x.json"]
+
+
+def test_write_json_does_not_retry_errors_that_are_not_sharing_violations(tmp_path, monkeypatch):
+    calls = []
+
+    def broken_replace(src, dst):
+        calls.append(src)
+        raise OSError(errno.ENOSPC, "disk full")
+
+    monkeypatch.setattr(state.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(os, "replace", broken_replace)
+    with pytest.raises(OSError):
+        state.write_json(tmp_path / "x.json", {"a": 1})
+    assert len(calls) == 1
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_read_json_returns_none_for_a_corrupt_file(tmp_path):
