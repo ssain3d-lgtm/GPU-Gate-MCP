@@ -1,7 +1,7 @@
 import pytest
 
-from fakes import FakeClock, FakeComfy, FakeStrata
-from gpu_gate.config import ComfyCfg, StrataCfg
+from fakes import FakeClock, FakeComfy, FakeStrata, FakeVoice
+from gpu_gate.config import ComfyCfg, StrataCfg, VoiceCfg
 
 API_KEY = "test-key"
 
@@ -74,3 +74,26 @@ def fake_comfy(comfy_factory):
 @pytest.fixture
 def fake_comfy_reject(comfy_factory):
     return comfy_factory(reject=True)
+
+
+@pytest.fixture
+def voice_factory(tmp_path):
+    """Build (FakeVoice, VoiceCfg) pairs from FakeVoice keyword arguments; all are stopped at the end.
+
+    The config points at tmp_path as the VoiceStudio folder; the scripts are left unset.
+    """
+    started: list[FakeVoice] = []
+
+    def make(**kwargs):
+        fake = FakeVoice(**kwargs)
+        started.append(fake)
+        return fake, VoiceCfg(dir=str(tmp_path), url=fake.start())
+
+    yield make
+    for fake in started:
+        fake.stop()
+
+
+@pytest.fixture
+def fake_voice(voice_factory):
+    return voice_factory()

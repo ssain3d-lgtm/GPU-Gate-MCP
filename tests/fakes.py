@@ -294,3 +294,19 @@ class FakeComfy(FakeServer):
             self.queue_posts.append(json.loads(body.decode("utf-8")))
             return 200, b""
         return super().handle(method, path, body)
+
+
+class FakeVoice(FakeServer):
+    """Mirrors the one VoiceStudio endpoint the adapter polls: GET /health.
+
+    status: what /health reports (a real backend says "ok" once it can take work).
+    """
+
+    def __init__(self, status: str = "ok") -> None:
+        super().__init__()
+        self.status = status
+
+    def handle(self, method, path, body):
+        if method == "GET" and path.split("?", 1)[0] == "/health":
+            return 200, {"status": self.status}
+        return super().handle(method, path, body)
