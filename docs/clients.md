@@ -9,13 +9,15 @@ GPU-Gate 는 stdio MCP 서버다. 클라이언트가 `python <repo>/gpu_gate_ser
 
 ## 먼저 읽기: 도구 타임아웃
 
-서버는 진행 알림을 보내지 않고, `comfy_batch`/`voice_batch` 호출은 배치가 끝날 때까지 돌아오지 않는다. 클라이언트의 도구 타임아웃이 배치보다 짧으면 클라이언트가 호출을 끊고 취소를 보내며, 그러면 배치가 취소된다. 배치의 기본 제한은 `limits.batch_timeout_s` (예시 설정은 9000초, 2시간 30분)이므로 클라이언트 타임아웃은 이보다 길게, 아래 스니펫처럼 3시간으로 잡는다. `batch_timeout_s` 를 늘렸다면 이 값도 함께 늘린다.
+`comfy_batch`/`voice_batch` 호출은 배치가 끝날 때까지 돌아오지 않는다. 클라이언트의 도구 타임아웃이 배치보다 짧으면 클라이언트가 호출을 끊고 취소를 보내며, 그러면 배치가 취소된다. 배치의 기본 제한은 `limits.batch_timeout_s` (예시 설정은 9000초, 2시간 30분)이므로 클라이언트 타임아웃은 이보다 길게, 아래 스니펫처럼 3시간으로 잡는다. `batch_timeout_s` 를 늘렸다면 이 값도 함께 늘린다.
 
-| 클라이언트 | 설정 파일 | 타임아웃 |
+클라이언트가 호출에 progress 토큰(`params._meta.progressToken`)을 실어 보내면, 서버는 기다리는 동안 배치 파일을 읽을 때마다(기본 2초마다) `notifications/progress` 를 보낸다(`progress` 는 끝난 잡 수, `total` 은 전체 잡 수). 토큰을 보내지 않는 클라이언트에게는 아무것도 보내지 않는다. 진행 알림으로 "오래 조용하면 끊는" 타이머를 다시 맞추는지는 클라이언트마다 다르므로, 아래 타임아웃 설정은 진행 알림과 관계없이 모두 넣는다.
+
+| 클라이언트 | 설정 파일 | 넣을 값 |
 |---|---|---|
 | opencode | `opencode.jsonc` | 실행 타임아웃의 기본값이 12시간이라 따로 안 건드려도 된다. `startup` 은 서버가 뜨는 시간(밀리초). |
-| Qwen Code | `~/.qwen/settings.json` | 기본 도구 타임아웃이 10분이라 `timeout` 을 반드시 늘린다(밀리초). |
-| Hermes | `config.yaml` | 기본 300초라 `timeout` 을 늘린다(초). |
+| Qwen Code | `~/.qwen/settings.json` | 서버 항목의 `timeout`(기본 10분, 밀리초) **과** 최상위 `mcp.toolIdleTimeoutMs`(기본 5분, 최대 1시간, 밀리초) 둘 다. |
+| Hermes | `config.yaml` | 서버 항목의 `timeout`(기본 300초) **과** 최상위 `timeouts.tools.sequential_call`(기본 420초) 둘 다(초). |
 
 ## opencode
 
@@ -52,10 +54,21 @@ opencode v2 의 `opencode.jsonc` 에서는 서버 항목이 `mcp.servers` 아래
 
 `timeout` 은 밀리초(3시간)다. 기본값 10분을 그대로 두면 10분이 넘는 배치가 도중에 끊긴다.
 
+**이것만으로는 부족하다.** Qwen Code 는 서버 항목의 `timeout` 과 따로, 도구 호출이 일정 시간 아무 메시지 없이 조용하면 끊는 타이머 `mcp.toolIdleTimeoutMs`(기본 300000 = 5분, 최대 3600000 = 1시간)를 둔다. 기본값이면 `timeout` 을 3시간으로 잡아도 5분이 넘는 배치가 정확히 5분에 끊긴다(Qwen Code 0.25.2 에서 확인). `settings.json` 최상위의 `"mcp"` 에 최댓값을 넣는다(이미 `"mcp"` 가 있으면 그 안에 키만 더한다).
+
+```json
+"mcp": {
+  "toolIdleTimeoutMs": 3600000
+}
+```
+
+이 타이머는 진행 알림이 오면 다시 맞춰진다. 게이트는 클라이언트가 progress 토큰을 보낼 때만 진행 알림을 보내므로, **1시간보다 긴 배치는 클라이언트가 진행 알림을 받아들일 때(토큰을 보내고 알림마다 타이머를 다시 맞출 때)만 끝까지 간다.** 그렇지 않으면 1시간에서 끊긴다. 긴 일은 1시간 안쪽의 배치 여러 개로 나누는 편이 안전하다.
+
 끄려면 `settings.json` 의 `mcp.excluded` 목록에 `"gpu-gate"` 를 넣는다.
 
 ```json
 "mcp": {
+  "toolIdleTimeoutMs": 3600000,
   "excluded": ["gpu-gate"]
 }
 ```
@@ -84,6 +97,17 @@ mcp_servers:
 ```
 
 `timeout` 은 초(3시간)다. 끄려면 같은 항목에 `enabled: false` 를 더한다.
+
+**이것만으로는 부족하다.** Hermes 는 MCP 서버의 `timeout` 과 따로, 에이전트가 부르는 모든 도구 호출에 자기 마감 시간을 건다. 도구를 하나씩 부를 때는 `timeouts.tools.sequential_call`, 이것이 없으면 `timeouts.tools.concurrent_batch`(기본 420초)를 쓰고, 여러 도구를 한꺼번에 부를 때는 `timeouts.tools.concurrent_batch` 를 쓴다. 그래서 `timeout: 10800` 만 넣으면 게이트 호출이 420초(7분)에 끊긴다. `config.yaml` 최상위에 `timeouts:` 절을 더한다(이미 있으면 그 안에 키만 더한다).
+
+```yaml
+timeouts:
+  tools:
+    sequential_call: 10800
+    concurrent_batch: 10800
+```
+
+값은 초다. `0` 이나 음수를 넣으면 그 마감 시간이 아예 꺼지지만 다른 모든 도구에도 적용되므로, 위처럼 배치 제한보다 긴 값을 권한다. `concurrent_batch` 는 에이전트가 게이트 호출을 다른 도구와 한꺼번에 부를 때를 위한 것이며, 그 경우 함께 불린 다른 도구가 멈췄을 때 기다리는 시간도 같이 길어진다.
 
 ## 끄는 방법 요약
 

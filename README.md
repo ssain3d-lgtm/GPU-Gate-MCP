@@ -30,7 +30,7 @@ GPU-Gate-MCP 는 이 순서 전체를 도구 호출 하나로 묶는다. 에이�
 
 0. **점검** — 잡 목록과 `comfy_variant` 옵션(그 `.bat` 이 `comfyui.dir` 에 있는지)을 확인하고, `other_llm_ports` 의 다른 LLM 서버가 응답하면 배치를 거부한다(`force` 로 무시할 수 있다). 여기서 거부되면 Strata 는 건드리지 않는다.
 1. **Strata 내리기** — 진행 중인 응답(턴)이 끝나기를 기다렸다가 `POST /unload?wait=1` 로 엔진을 내린다. 서버가 바쁘면 1분마다 다시 시도하고, 15분이 지나도 바쁘면 `strata pause failed: busy` 로 배치를 포기한다(LLM 은 건드리지 않은 상태 그대로).
-2. **실행기 시작** — ComfyUI(또는 VoiceStudio)를 사용자의 시작 스크립트로 띄우고 응답할 때까지 기다린다. 이미 떠 있으면 그것을 쓴다.
+2. **실행기 시작** — ComfyUI(또는 VoiceStudio)를 사용자의 시작 스크립트로 띄우고 응답할 때까지 기다린다. 이미 떠 있으면 그것을 쓴다. 응답은 없지만 그 포트를 누가 이미 잡고 있으면(밖에서 막 띄운 ComfyUI 가 아직 뜨는 중) 새로 띄우지 않고 `start_timeout_s` 까지 기다렸다가 그것을 쓴다(외부 실행기로 다룬다).
 3. **잡 실행** — 잡을 순서대로 실행한다. 연달은 워크플로우는 한 묶음으로 큐에 넣고 순서대로 기다리며, 명령(command) 잡은 앞선 잡이 모두 끝난 뒤 하나씩 실행한다.
 4. **정리** — 큐에 남은 프롬프트를 지우고, ComfyUI 의 `/free` 로 모델을 내리고, 실행기를 끈다(`keep_executor` 인 경우 제외). 끈 프로세스가 VRAM 을 놓았는지 최대 60초 확인한다.
 5. **Strata 올리기** — `POST /load` 로 엔진을 다시 올리고 `/health` 가 `loaded` 가 될 때까지 기다린다. **항상 실행된다.** 잡이 실패하거나 취소되거나 클라이언트가 사라져도 4~5단계는 `finally` 로 보장된다.
@@ -270,7 +270,7 @@ ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경�
 - **LLM 과 GPU 작업은 동시에 못 돌린다.** 한 장의 GPU 에서는 그렇다. 배치 중에는 LLM 이 응답하지 못한다(그 사이 대화를 시작하면 경고만 남고 배치는 계속 간다).
 - **다른 LLM 서버는 막는다.** `other_llm_ports` 의 서버가 응답하면 `force` 가 아닌 한 배치를 거부한다. 게이트는 Strata 만 내리고 올린다.
 - **한 번에 배치 하나.** 다른 클라이언트에서 부르면 `busy`.
-- **진행 알림이 없다.** 서버는 progress 알림을 보내지 않는다. 클라이언트의 도구 타임아웃이 배치보다 짧으면 클라이언트가 호출을 끊고 취소를 보낸다. 타임아웃을 길게 잡는 법은 [docs/clients.md](docs/clients.md).
+- **진행 알림은 토큰이 있을 때만.** 클라이언트가 호출에 progress 토큰(`params._meta.progressToken`)을 실어 보내면, 서버는 배치를 기다리는 동안 배치 파일을 읽을 때마다 `notifications/progress`(끝난 잡 수/전체 잡 수)를 보낸다. 토큰이 없으면 보내지 않는다. 그래도 클라이언트의 도구 타임아웃(그리고 Qwen Code 의 무응답 타이머, Hermes 의 도구 마감 시간)이 배치보다 짧으면 클라이언트가 호출을 끊고 취소를 보낸다. 클라이언트별 설정은 [docs/clients.md](docs/clients.md).
 - **Windows 우선.** Windows 에서만 검증했다. POSIX 분기(프로세스 종료, 포트 조회)는 있으나 확인하지 않았고, GPU 프로세스별 VRAM 조회는 Windows 성능 카운터에 기댄다.
 - **시작 `.bat` 해석은 단순하다.** `set` 줄과 `main.py` 실행 줄만 이해한다. 그 이상이 필요하면 `comfyui.command`.
 - **`voice_batch` 는 잡별 시간·부분 결과가 없다.** 시간 초과나 취소면 일부 파일이 이미 쓰였어도 모든 잡의 `outputs` 가 비어 있다.
@@ -290,8 +290,10 @@ ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경�
 | 잡 `error`: `workflow file not found: <경로>` | 경로가 게이트가 도는 PC 에서 존재하지 않는다. 절대 경로를 넘긴다. |
 | 결과 `error`: `strata pause failed: busy` | Strata 가 긴 생성을 하고 있었다. 게이트는 응답이 끝나기를 15분까지 기다린 뒤 포기하며, 이때 LLM 은 건드리지 않았다. 나중에 다시 부른다. |
 | 결과 `error`: `comfyui not ready after N s` / `comfyui exited with code N before it was ready` | ComfyUI 가 제때 뜨지 못했다. 로그에 ComfyUI 의 출력이 있다. 느린 PC 이면 `comfyui.start_timeout_s` 를 늘린다. |
+| 결과 `error`: `comfyui on port N (started outside the gate) did not answer within N s` | 그 포트를 다른 프로세스가 잡고 있는데 응답하지 않았다(밖에서 띄운 ComfyUI 가 멈췄거나, 다른 프로그램이 포트를 쓴다). 게이트는 자기가 띄우지 않은 그 프로세스를 끄지 않는다. 직접 확인하고 끈 뒤 다시 부른다. |
+| 경고 `executor was already starting on port N; reused it` | 밖에서 막 띄운 실행기가 아직 뜨는 중이라 기다렸다가 썼다. 정상이다. `keep_executor` 가 아니면 배치 뒤에 그것을 끈다. |
 | `strata.restored: false`, 결과 `error`: `strata resume failed: ...` | LLM 이 올라오지 않았다(3번 시도). 로그를 보고 Strata 에 직접 `POST /load` 를 보내거나 재시작한다. |
-| 에이전트가 도중에 호출을 끊었다 | 클라이언트의 도구 타임아웃이 배치보다 짧다. [docs/clients.md](docs/clients.md) 의 값으로 늘린다. |
+| 에이전트가 도중에 호출을 끊었다 | 클라이언트의 도구 타임아웃이 배치보다 짧다. 정확히 5분(Qwen Code `mcp.toolIdleTimeoutMs`)이나 7분(Hermes `timeouts.tools.sequential_call`)에 끊겼다면 서버 항목의 `timeout` 이 아닌 그 키다. [docs/clients.md](docs/clients.md) 의 값으로 늘린다. |
 
 ## 개발
 
