@@ -348,6 +348,9 @@ def fake_deps(
     pause: dict | None = None,
     resume: dict | None = None,
     comfy_running: bool = False,
+    ready=None,
+    port_busy: bool = False,
+    proc_code: int | None = None,
     start_error: Exception | None = None,
     cold_start_s: float | None = 12.0,
     load_errors: dict | None = None,
@@ -365,6 +368,9 @@ def fake_deps(
     health: a list of strata_health answers in call order (the last one repeats).
     pause / resume: the adapters' answers (default: unloaded / loaded after 30 s).
     comfy_running: exec_ready answers True (an executor someone else started).
+    ready: a list of exec_ready answers in call order (the last one repeats); wins over comfy_running.
+    port_busy: what exec_port_busy answers (something listens on the executor's port).
+    proc_code: the exit code the started FakeProc reports (None = still running).
     start_error: exec_start raises it. cold_start_s: what exec_wait_ready returns (None = never ready).
     load_errors: {workflow basename: exception} for exec_load_workflow. submit_error: every
         exec_submit raises it.
@@ -382,7 +388,14 @@ def fake_deps(
     clock = clock or FakeClock()
     calls: list = []
     engine = {"loaded": strata_loaded}
-    counters = {"health": 0, "submit": 0, "wait": 0, "command": 0}
+    counters = {"health": 0, "submit": 0, "wait": 0, "command": 0, "ready": 0}
+
+    def exec_ready():
+        if ready is None:
+            return comfy_running
+        answer = ready[min(counters["ready"], len(ready) - 1)]
+        counters["ready"] += 1
+        return answer
 
     def strata_health():
         if health is None:
@@ -410,7 +423,7 @@ def fake_deps(
     def exec_start(log_path, log, bat_override=None):
         if start_error is not None:
             raise start_error
-        return FakeProc()
+        return FakeProc(code=proc_code)
 
     def exec_load_workflow(path):
         error = (load_errors or {}).get(os.path.basename(path))
@@ -458,7 +471,8 @@ def fake_deps(
         "strata_health": strata_health,
         "strata_pause": strata_pause,
         "strata_resume": strata_resume,
-        "exec_ready": lambda: comfy_running,
+        "exec_ready": exec_ready,
+        "exec_port_busy": lambda: port_busy,
         "exec_start": exec_start,
         "exec_wait_ready": lambda proc, timeout_s: cold_start_s,
         "exec_submit": exec_submit,

@@ -4,7 +4,7 @@ import json
 import pytest
 
 from fakes import FakeClock, fake_deps
-from gpu_gate import comfyui, state, strata, voicestudio, worker
+from gpu_gate import comfyui, procs, state, strata, voicestudio, worker
 from gpu_gate.config import ComfyCfg, Config, Limits, StrataCfg, VoiceCfg
 
 
@@ -78,7 +78,7 @@ def calls_to(deps, name):
 def test_happy_path_runs_the_six_steps_in_order(home, cfg, log, wf):
     deps = fake_deps()
     r = worker.run_batch(home, batch(jobs=[wf("a.json"), wf("b.json")]), cfg, deps, log)
-    assert [c[0] for c in deps.calls] == ["other_llm_alive", "strata_health", "strata_pause", "exec_ready", "exec_start", "exec_wait_ready", "exec_submit", "exec_submit", "exec_wait", "exec_wait", "exec_free", "exec_stop", "pid_vram_gone", "strata_resume"]
+    assert [c[0] for c in deps.calls] == ["other_llm_alive", "strata_health", "strata_pause", "exec_ready", "exec_port_busy", "exec_start", "exec_wait_ready", "exec_submit", "exec_submit", "exec_wait", "exec_wait", "exec_free", "exec_stop", "pid_vram_gone", "strata_resume"]
     assert r["ok"] and [j["status"] for j in r["jobs"]] == ["done", "done"] and r["executor"]["started_by_gate"] and r["strata"]["restored"]
     assert [j["name"] for j in r["jobs"]] == ["a.json", "b.json"]
     assert r["jobs"][0]["outputs"] == ["out/p1.png"]
@@ -161,6 +161,56 @@ def test_external_executor_is_reused_and_stopped(home, cfg, log, wf):
     r = worker.run_batch(home, batch([wf("a.json")], {"keep_executor": True}), cfg, deps, log)
     assert "exec_free" in names(deps) and "exec_stop" not in names(deps) and "pid_vram_gone" not in names(deps)
     assert r["executor"]["stopped"] is False and r["ok"]
+
+
+def test_external_executor_still_starting_is_waited_for_not_started_twice(home, cfg, log, logs, wf):
+    # Someone started ComfyUI seconds ago: it holds its port but does not answer /system_stats yet.
+    deps = fake_deps(ready=[False, False, False, True], port_busy=True)
+    r = worker.run_batch(home, batch([wf("a.json")]), cfg, deps, log)
+    assert "exec_start" not in names(deps) and "exec_wait_ready" not in names(deps)
+    assert names(deps).count("exec_ready") == 4 and names(deps).count("exec_port_busy") == 1
+    assert deps.clock.sleeps == [1, 1, 1]  # one look a second
+    assert r["executor"]["started_by_gate"] is False and r["executor"]["cold_start_s"] is None
+    port = procs.url_port(cfg.comfyui.url)
+    assert f"executor was already starting on port {port}; reused it" in r["warnings"]
+    assert r["ok"] and [j["status"] for j in r["jobs"]] == ["done"]
+    assert calls_to(deps, "exec_stop")[0][1][0] is None  # an external one is stopped by its port
+
+
+def test_busy_port_that_never_answers_skips_the_jobs_and_stops_nothing(home, cfg, log, logs, wf):
+    deps = fake_deps(port_busy=True)
+    r = worker.run_batch(home, batch([wf("a.json"), wf("b.json")]), cfg, deps, log)
+    port = procs.url_port(cfg.comfyui.url)
+    assert "exec_start" not in names(deps)
+    assert [j["status"] for j in r["jobs"]] == ["skipped", "skipped"]
+    assert str(port) in r["error"] and r["ok"] is False
+    assert deps.clock.t >= cfg.comfyui.start_timeout_s
+    # Steps 4-5 still run, but the process on the port is not the gate's: it is left alone.
+    assert "worker: cleanup" in logs and "worker: restoring" in logs
+    assert "exec_stop" not in names(deps) and "exec_free" not in names(deps)
+    assert names(deps)[-1] == "strata_resume" and r["strata"]["restored"]
+    assert r["executor"] == {"kind": "comfyui", "started_by_gate": False, "cold_start_s": None, "stopped": False}
+
+
+def test_gate_started_executor_lost_the_port_to_an_external_one(home, cfg, log, wf):
+    # The gate's ComfyUI exits before it is ready (the port is taken) while the one someone else
+    # started comes up on that port.
+    deps = fake_deps(ready=[False, True], cold_start_s=None, proc_code=1)
+    r = worker.run_batch(home, batch([wf("a.json")]), cfg, deps, log)
+    port = procs.url_port(cfg.comfyui.url)
+    assert "exec_start" in names(deps)
+    assert r["executor"]["started_by_gate"] is False and r["executor"]["cold_start_s"] is None
+    assert any(f"port {port}" in w and "reused" in w for w in r["warnings"])
+    assert r["ok"] and r["error"] is None and [j["status"] for j in r["jobs"]] == ["done"]
+    assert calls_to(deps, "exec_stop")[0][1][0] is None  # by its port, not the gate's dead process
+
+
+def test_port_busy_asks_for_listeners_on_the_executor_port(monkeypatch):
+    asked = []
+    monkeypatch.setattr(procs, "listener_pids", lambda port: asked.append(port) or ([77] if port == 8188 else []))
+    assert worker._port_busy("http://127.0.0.1:8188") is True
+    assert worker._port_busy("http://127.0.0.1:3900") is False
+    assert asked == [8188, 3900]
 
 
 def test_keep_executor_does_not_keep_one_the_gate_started(home, cfg, log, wf):
@@ -465,6 +515,7 @@ def test_default_deps_binds_the_adapters_by_kind(cfg):
     assert d.strata_health.func is strata.health and d.strata_health.args == (cfg.strata,)
     assert d.strata_pause.func is strata.pause and d.strata_resume.func is strata.resume
     assert d.exec_ready.func is comfyui.ready and d.exec_ready.args == (cfg.comfyui,)
+    assert d.exec_port_busy.func is worker._port_busy and d.exec_port_busy.args == (cfg.comfyui.url,)
     assert d.exec_start.func is comfyui.start and d.exec_wait_ready.func is comfyui.wait_ready
     assert d.exec_submit.func is comfyui.submit and d.exec_wait.func is comfyui.wait
     assert d.exec_free.func is comfyui.free and d.exec_stop.func is comfyui.stop
@@ -473,6 +524,7 @@ def test_default_deps_binds_the_adapters_by_kind(cfg):
 
     v = worker.default_deps(cfg, "voicestudio")
     assert v.exec_ready.func is voicestudio.ready and v.exec_ready.args == (cfg.voicestudio,)
+    assert v.exec_port_busy.func is worker._port_busy and v.exec_port_busy.args == (cfg.voicestudio.url,)
     assert v.exec_start.func is voicestudio.start and v.exec_wait_ready.func is voicestudio.wait_ready
     assert v.exec_stop.func is voicestudio.stop
     assert v.voice_run_batch.func is voicestudio.run_batch and v.voice_run_batch.args == (cfg.voicestudio,)

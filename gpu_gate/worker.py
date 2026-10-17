@@ -2,7 +2,8 @@
 
     0 check the jobs and that no other LLM server is running (`options.force` overrides)
     1 pause Strata (unload its engine)
-    2 start the executor (ComfyUI or VoiceStudio), or reuse the one that is already up
+    2 start the executor (ComfyUI or VoiceStudio), or reuse the one that is already up (also one
+      that holds its port but is still starting: it is waited for, never started a second time)
     3 run the jobs in order, in segments: consecutive workflows are queued together and then waited
       for one by one; a command runs once every earlier job has finished (VoiceStudio: one run of
       the batch script for all jobs)
@@ -40,6 +41,7 @@ from . import comfyui, config, gpu, procs, state, strata, voicestudio
 WATCH_S = 10  # how often step 3 looks at Strata's /health
 VRAM_GONE_S = 60  # how long a stopped executor pid is given to release its VRAM
 COMMAND_POLL_S = 0.5
+READY_POLL_S = 1  # how often step 2 looks at an executor that someone else is starting
 KILL_WAIT_S = 5.0
 CONNECT_TIMEOUT_S = 1.0
 MAX_ERROR_CHARS = 300
@@ -56,6 +58,7 @@ class Deps:
     strata_pause: Callable[[Log], dict]
     strata_resume: Callable[[Log], dict]
     exec_ready: Callable[[], bool]
+    exec_port_busy: Callable[[], bool]  # something listens on the executor's port (it may be starting)
     exec_start: Callable[..., Any]  # (log_path, log, bat_override=None) -> Popen
     exec_wait_ready: Callable[[Any, float], float | None]  # (proc, timeout_s)
     exec_submit: Callable[[dict, str], str]  # (workflow, client_id) -> prompt id
@@ -86,6 +89,11 @@ def _tcp_alive(ports: list[int]) -> list[int]:
         except OSError:
             pass
     return alive
+
+
+def _port_busy(url: str) -> bool:
+    """True when a process listens on the TCP port of url (an executor that may still be starting)."""
+    return bool(procs.listener_pids(procs.url_port(url)))
 
 
 def _run_command(
@@ -143,6 +151,7 @@ def default_deps(cfg: config.Config, kind: str = "comfyui") -> Deps:
         strata_pause=functools.partial(strata.pause, cfg.strata, **clock),
         strata_resume=functools.partial(strata.resume, cfg.strata, **clock),
         exec_ready=functools.partial(executor.ready, ecfg),
+        exec_port_busy=functools.partial(_port_busy, ecfg.url),
         exec_start=functools.partial(executor.start, ecfg),
         exec_wait_ready=functools.partial(executor.wait_ready, ecfg, **clock),
         exec_submit=functools.partial(comfyui.submit, cfg.comfyui),
@@ -467,13 +476,46 @@ class _Run:
     def _executor_cfg(self):
         return self.cfg.comfyui if self.kind == "comfyui" else self.cfg.voicestudio
 
+    def _port(self) -> int:
+        return procs.url_port(self._executor_cfg().url)
+
+    def _ready_within(self, timeout: float) -> bool:
+        """Look at the executor once a second until it answers; False when timeout passes first."""
+        t0 = self.deps.now()
+        while self.deps.now() - t0 < timeout:
+            self.deps.sleep(READY_POLL_S)
+            if self.deps.exec_ready():
+                return True
+        return False
+
+    def _reuse_external(self, warning: str) -> bool:
+        """Use an executor someone else started: step 4 treats it as external (stopped by its port
+        unless keep_executor, never by a pid of the gate's)."""
+        self.log(f"worker: {warning}")
+        self.warnings.append(warning)
+        self.proc = None
+        self.executor_up = True
+        self.result["executor"]["started_by_gate"] = False
+        return True
+
     def _start_executor(self) -> bool:
         """Step 2. True when the executor is up."""
         executor = self.result["executor"]
+        timeout = self._executor_cfg().start_timeout_s
         if self.deps.exec_ready():
             self.log(f"worker: {self.kind} is already running; using it")
             self.executor_up = True
             return True
+        if self.deps.exec_port_busy():
+            # Something holds the port but does not answer yet: an executor started from outside a
+            # moment ago. A second one on the same port would be the gate's to stop, not that one.
+            port = self._port()
+            self.log(f"worker: port {port} is in use but {self.kind} does not answer yet; waiting for it")
+            if self._ready_within(timeout):
+                return self._reuse_external(f"executor was already starting on port {port}; reused it")
+            self._fail(f"{self.kind} on port {port} (started outside the gate) did not answer within {timeout} s")
+            self._skip_undecided()
+            return False
         variant = self.options.get("comfy_variant") if self.kind == "comfyui" else None
         try:
             self.proc = self.deps.exec_start(self.log_path, self.log, bat_override=variant)
@@ -483,14 +525,22 @@ class _Run:
             return False
         self.executor_up = True
         executor["started_by_gate"] = True
-        timeout = self._executor_cfg().start_timeout_s
+        t0 = self.deps.now()
         cold = self.deps.exec_wait_ready(self.proc, timeout)
         if cold is None:
             code = self.proc.poll()
-            if code is None:
-                self._fail(f"{self.kind} not ready after {timeout} s")
-            else:
+            if code is not None:
+                # The gate's process ended first: when another one holds the port (it was started
+                # from outside in the meantime), that one is used instead.
+                left = max(0.0, timeout - (self.deps.now() - t0))
+                if self.deps.exec_ready() or (self.deps.exec_port_busy() and self._ready_within(left)):
+                    return self._reuse_external(
+                        f"{self.kind} started by the gate exited with code {code}, but another one "
+                        f"answers on port {self._port()}; reused it"
+                    )
                 self._fail(f"{self.kind} exited with code {code} before it was ready")
+            else:
+                self._fail(f"{self.kind} not ready after {timeout} s")
             self._skip_undecided()
             return False
         executor["cold_start_s"] = cold
