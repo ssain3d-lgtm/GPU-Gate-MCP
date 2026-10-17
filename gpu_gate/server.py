@@ -21,6 +21,7 @@ from typing import Any, Callable
 from . import VERSION, comfyui, config, gpu, procs, state, strata, voicestudio
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+EOF_GRACE_S = 1.0  # at end of input, how long calls in progress get to write their reply
 WARN_VRAM_MB = 300  # another process holding this much while the LLM is loaded is worth a warning
 WARN_DWM_MB = 3072  # the desktop compositor always holds some; only a lot of it is worth one
 LAUNCHER = Path(__file__).resolve().parent.parent / "gpu_gate_server.py"
@@ -224,7 +225,7 @@ class Server:
         self.sleep = sleep
         self.process_vram = process_vram
         self._mu = threading.Lock()  # guards _running
-        # request id of a tools/call in progress -> {"batch_id": str | None, "cancelled": bool}
+        # request id of a tools/call in progress -> {"batch_id", "pid", "cancelled"}
         self._running: dict = {}
         self._batch_mu = threading.Lock()  # one batch call per process
         self._write_mu = threading.Lock()
@@ -281,7 +282,7 @@ class Server:
 
     def _record(self, rid: Any) -> dict:
         with self._mu:
-            return self._running.setdefault(rid, {"batch_id": None, "cancelled": False})
+            return self._running.setdefault(rid, {"batch_id": None, "pid": None, "cancelled": False})
 
     def _tools_call(self, params: dict, rid: Any) -> dict:
         self._record(rid)
@@ -410,6 +411,10 @@ class Server:
             self._abort(path, doc, batch_id)
             raise _ToolError({"error": f"could not start the worker: {_describe(err)}"}) from err
         state.write_lock(self.home, batch_id, pid)
+        with self._mu:
+            record = self._running.get(rid)
+            if record is not None:
+                record["pid"] = pid
         return self._wait(cfg, path, doc, batch_id, pid, log_path, log)
 
     def _abort(self, path: Path, doc: dict, batch_id: str) -> None:
@@ -539,11 +544,13 @@ class Server:
     def serve(self, inp, out) -> None:
         """Read one JSON-RPC message per line from inp (bytes) and write replies to out (bytes).
 
-        tools/call runs on a thread so ping and notifications/cancelled are answered during a
-        batch. Returns at end of input once the calls in progress have answered.
+        tools/call runs on a (daemon) thread so ping and notifications/cancelled are answered during
+        a batch. At end of input the calls in progress get EOF_GRACE_S to answer; a batch still
+        running then is left to its detached worker (its result lands in the batch file and
+        state.json), so a client waiting for this process to exit is not held up by it.
         """
         self._out = out
-        threads: list[threading.Thread] = []
+        threads: list[tuple[threading.Thread, dict]] = []
         for raw in inp:
             line = raw.strip()
             if not line:
@@ -557,13 +564,20 @@ class Server:
                 record = self._record(msg["id"])  # now, so a cancel that comes right after counts
                 thread = threading.Thread(target=self._call_thread, args=(msg, record), daemon=True)
                 thread.start()
-                threads = [t for t in threads if t.is_alive()] + [thread]
+                threads = [(t, r) for t, r in threads if t.is_alive()] + [(thread, record)]
                 continue
             reply = self.handle(msg)
             if reply is not None:
                 self._send(reply)
-        for thread in threads:
-            thread.join()
+        deadline = time.monotonic() + EOF_GRACE_S
+        for thread, record in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive() and record["batch_id"] is not None:
+                print(
+                    f"gpu-gate: stdin closed; batch {record['batch_id']} continues in worker pid "
+                    f"{record['pid']}",
+                    file=sys.stderr,
+                )
 
 
 def make_server(home: Path) -> Server:

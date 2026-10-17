@@ -309,6 +309,34 @@ def test_stdout_carries_only_protocol(server, capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_serve_returns_promptly_when_stdin_closes_during_a_batch(home, tmp_path, fake_strata, capsys):
+    _, strata_cfg = fake_strata
+    cfg = make_cfg(tmp_path, strata_cfg)
+    spawn = FakeSpawn(mode="live")  # a worker that is alive and never finishes on its own
+    server = Server(home, lambda: cfg, spawn, poll_interval=0.01)
+    line = json.dumps(rpc("tools/call", {"name": "comfy_batch", "arguments": {"jobs": JOBS}}, id=5))
+
+    def stdin():
+        yield line.encode("utf-8") + b"\n"
+        assert spawn.spawned.wait(5)  # EOF comes once the batch is running
+
+    before = set(threading.enumerate())
+    t0 = time.monotonic()
+    server.serve(stdin(), io.BytesIO())
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 2
+    assert state.paths(home).lock.exists()  # the batch is still considered running
+    batch_id = spawn.seen["batch_id"]
+    assert f"stdin closed; batch {batch_id} continues in worker pid {os.getpid()}" in capsys.readouterr().err
+
+    # Let the call end so no thread outlives the test.
+    finish_batch(spawn.paths[0])
+    for thread in set(threading.enumerate()) - before:
+        thread.join(5)
+        assert not thread.is_alive()
+
+
 def test_worker_argv_uses_the_root_launcher(tmp_path):
     argv = worker_argv(str(tmp_path / "b.json"))
     assert argv[0] == sys.executable
