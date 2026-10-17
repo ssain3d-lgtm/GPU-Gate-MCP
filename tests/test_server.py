@@ -337,6 +337,69 @@ def test_serve_returns_promptly_when_stdin_closes_during_a_batch(home, tmp_path,
         assert not thread.is_alive()
 
 
+def test_lock_is_released_when_the_spawn_fails_and_the_disk_does_too(server, home, spawn, monkeypatch):
+    real_write_json = state.write_json
+
+    def broken_spawn(batch_path):
+        spawn.paths.append(batch_path)
+        raise OSError("no such interpreter")
+
+    def write_json(path, data):
+        if spawn.paths:  # once the spawn has been tried, the disk fails as well
+            raise OSError("disk full")
+        real_write_json(path, data)
+
+    server.spawn_worker = broken_spawn
+    monkeypatch.setattr(state, "write_json", write_json)
+
+    res = call(server, "comfy_batch", {"jobs": JOBS})
+
+    assert res["isError"] is True
+    assert "could not start the worker" in res["structuredContent"]["error"]
+    assert not state.paths(home).lock.exists()
+
+
+def test_lock_is_released_when_anything_before_the_spawn_raises(server, home, spawn, monkeypatch):
+    def boom(rid, batch_id):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(server, "_register_batch", boom)
+
+    res = call(server, "comfy_batch", {"jobs": JOBS})
+
+    assert res["isError"] is True
+    assert res["structuredContent"]["error"] == "internal error in comfy_batch: RuntimeError: unexpected"
+    assert not state.paths(home).lock.exists()
+    assert spawn.paths == []
+
+
+def test_unhashable_ids_do_not_end_the_loop(server, spawn):
+    lines = [
+        {"jsonrpc": "2.0", "id": [1], "method": "tools/call",
+         "params": {"name": "comfy_batch", "arguments": {"jobs": JOBS}}},
+        {"jsonrpc": "2.0", "id": {"a": 1}, "method": "ping"},
+        {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": {"a": 1}}},
+        {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": [7]}},
+        rpc("ping", id=9),
+    ]
+    inp = io.BytesIO(b"".join(json.dumps(m).encode("utf-8") + b"\n" for m in lines))
+    out = io.BytesIO()
+
+    server.serve(inp, out)
+
+    replies = [json.loads(line) for line in out.getvalue().decode("utf-8").splitlines()]
+    assert [r.get("error", {}).get("code") for r in replies[:2]] == [-32600, -32600]
+    assert all(r["id"] is None for r in replies[:2])
+    assert replies[2] == {"jsonrpc": "2.0", "id": 9, "result": {}}
+    assert len(replies) == 3  # the two cancels were ignored
+    assert spawn.paths == []
+
+
+def test_arguments_that_are_not_an_object_are_named(server):
+    res = call(server, "comfy_batch", ["jobs"])
+    assert res["isError"] is True and res["structuredContent"]["error"] == "arguments: expected an object"
+
+
 def test_worker_argv_uses_the_root_launcher(tmp_path):
     argv = worker_argv(str(tmp_path / "b.json"))
     assert argv[0] == sys.executable

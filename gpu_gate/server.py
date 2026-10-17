@@ -197,6 +197,11 @@ def _error(rid: Any, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
 
+def _valid_id(value: Any) -> bool:
+    """JSON-RPC ids this server accepts: a string, an integer (not a bool) or null."""
+    return value is None or isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))
+
+
 def _tool_result(res: dict, is_error: bool) -> dict:
     return {
         "content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=1)}],
@@ -244,6 +249,8 @@ class Server:
                 self._on_cancelled(params.get("requestId") if isinstance(params, dict) else None)
             return None
         rid = msg["id"]
+        if not _valid_id(rid):
+            return _error(None, -32600, "invalid request: id must be a string or an integer")
         if not isinstance(method, str):
             return None if ("result" in msg or "error" in msg) else _error(rid, -32600, "invalid request")
         params = msg.get("params")
@@ -300,7 +307,7 @@ class Server:
         if args is None:
             args = {}
         schema = next(t["inputSchema"] for t in TOOLS if t["name"] == name)
-        problem = check_schema(schema, args)
+        problem = "arguments: expected an object" if not isinstance(args, dict) else check_schema(schema, args)
         if problem:
             return _tool_result({"error": problem}, True)
         try:
@@ -317,8 +324,10 @@ class Server:
 
     def _on_cancelled(self, rid: Any) -> None:
         """Cancel the batch this process runs for request rid; other ids are ignored."""
+        if rid is None or not _valid_id(rid):
+            return
         with self._mu:
-            record = self._running.get(rid) if rid is not None else None
+            record = self._running.get(rid)
             if record is None:
                 return
             record["cancelled"] = True
@@ -366,6 +375,13 @@ class Server:
         if lock is not None and lock.get("batch_id") == batch_id:
             state.release_lock(self.home)
 
+    def _release_quietly(self, batch_id: str) -> None:
+        """_release_if_ours for cleanup paths: a failure is reported on stderr, never raised."""
+        try:
+            self._release_if_ours(batch_id)
+        except Exception as err:
+            print(f"gpu-gate: could not release the lock of batch {batch_id}: {_describe(err)}", file=sys.stderr)
+
     def _batch(self, kind: str, args: dict, rid: Any) -> dict:
         if not self._batch_mu.acquire(blocking=False):
             raise _ToolError({"error": "busy", "batch": self._live_batch()})
@@ -383,6 +399,21 @@ class Server:
         lock = state.acquire_lock(self.home, batch_id)
         if lock is None:
             raise _ToolError({"error": "busy", "batch": self._live_batch()})
+        try:
+            path, pid, log_path, log, doc = self._start(cfg, kind, args, rid, lock, batch_id)
+        except BaseException:
+            # The lock holds this server's pid: left behind, every later batch would be busy.
+            self._release_quietly(batch_id)
+            raise
+        state.write_lock(self.home, batch_id, pid)
+        with self._mu:
+            record = self._running.get(rid)
+            if record is not None:
+                record["pid"] = pid
+        return self._wait(cfg, path, doc, batch_id, pid, log_path, log)
+
+    def _start(self, cfg, kind: str, args: dict, rid: Any, lock: state.Lock, batch_id: str):
+        """Everything between taking the lock and the worker's pid: the batch file and the spawn."""
         self._register_batch(rid, batch_id)
         path = state.batch_path(self.home, batch_id)
         log_path = state.log_path(self.home, batch_id)
@@ -410,19 +441,24 @@ class Server:
         except Exception as err:
             self._abort(path, doc, batch_id)
             raise _ToolError({"error": f"could not start the worker: {_describe(err)}"}) from err
-        state.write_lock(self.home, batch_id, pid)
-        with self._mu:
-            record = self._running.get(rid)
-            if record is not None:
-                record["pid"] = pid
-        return self._wait(cfg, path, doc, batch_id, pid, log_path, log)
+        return path, pid, log_path, log, doc
 
     def _abort(self, path: Path, doc: dict, batch_id: str) -> None:
-        current = state.read_json(path) or doc
-        current.update(state="aborted", finished=state.now_iso())
-        state.write_json(path, current)
-        state.set_state(self.home, "aborted", batch_id)
-        self._release_if_ours(batch_id)
+        """Mark the batch aborted (best effort: often the disk is why we got here) and release
+        the lock whatever happens."""
+        try:
+            try:
+                current = state.read_json(path) or doc
+                current.update(state="aborted", finished=state.now_iso())
+                state.write_json(path, current)
+            except Exception:
+                pass
+            try:
+                state.set_state(self.home, "aborted", batch_id)
+            except Exception:
+                pass
+        finally:
+            self._release_quietly(batch_id)
 
     def _wait(self, cfg, path: Path, doc: dict, batch_id: str, pid: int, log_path: Path, log) -> dict:
         while True:
@@ -541,6 +577,27 @@ class Server:
         if reply is not None and not record["cancelled"]:  # no reply to a cancelled request (MCP)
             self._send(reply)
 
+    def _serve_line(self, raw: bytes):
+        """Answer one input line; a tools/call is started on a thread, returned as (thread, record)."""
+        line = raw.strip()
+        if not line:
+            return None
+        try:
+            msg = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self._send(_error(None, -32700, "parse error"))
+            return None
+        if (isinstance(msg, dict) and msg.get("method") == "tools/call" and "id" in msg
+                and _valid_id(msg["id"])):
+            record = self._record(msg["id"])  # now, so a cancel that comes right after counts
+            thread = threading.Thread(target=self._call_thread, args=(msg, record), daemon=True)
+            thread.start()
+            return thread, record
+        reply = self.handle(msg)
+        if reply is not None:
+            self._send(reply)
+        return None
+
     def serve(self, inp, out) -> None:
         """Read one JSON-RPC message per line from inp (bytes) and write replies to out (bytes).
 
@@ -552,23 +609,13 @@ class Server:
         self._out = out
         threads: list[tuple[threading.Thread, dict]] = []
         for raw in inp:
-            line = raw.strip()
-            if not line:
-                continue
             try:
-                msg = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError):
-                self._send(_error(None, -32700, "parse error"))
+                started = self._serve_line(raw)
+            except Exception:
+                traceback.print_exc(file=sys.stderr)  # one bad line must not end the loop
                 continue
-            if isinstance(msg, dict) and msg.get("method") == "tools/call" and "id" in msg:
-                record = self._record(msg["id"])  # now, so a cancel that comes right after counts
-                thread = threading.Thread(target=self._call_thread, args=(msg, record), daemon=True)
-                thread.start()
-                threads = [(t, r) for t, r in threads if t.is_alive()] + [(thread, record)]
-                continue
-            reply = self.handle(msg)
-            if reply is not None:
-                self._send(reply)
+            if started is not None:
+                threads = [(t, r) for t, r in threads if t.is_alive()] + [started]
         deadline = time.monotonic() + EOF_GRACE_S
         for thread, record in threads:
             thread.join(max(0.0, deadline - time.monotonic()))
