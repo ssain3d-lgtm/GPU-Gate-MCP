@@ -69,9 +69,16 @@ def pause(
 
     Returns {"status": "unloaded" | "not loaded" | "absent" | "busy" | "error", "paused_s", "tries"}
     plus an "error" message when the status is "error".
-    A server that is running a request answers 409 (or 200 {"status": "busy"}); it is asked again
-    every 60 s and given up on ("busy") after 900 s in total. Any other answer (a wrong api key,
-    a server error) returns at once as "error"; no answer at all is "absent".
+    "absent" means the first /health probe got no answer: there is nothing to unload or restore.
+    Once Strata has answered, a later failure is never "absent" (the engine may be unloaded or not,
+    so the caller must still restore it):
+    - A server that is running a request answers 409 (or 200 {"status": "busy"}); it is asked again
+      every 60 s and given up on ("busy") after 900 s in total.
+    - Any other answer (a wrong api key, a server error), or no answer to the /unload request, returns
+      at once as "error".
+    - After an acknowledged unload, /health is polled every second for up to 60 s until it reports
+      loaded false. A lost health answer does not end the poll; if the last answer in those 60 s was
+      lost the result is "error"; if /health still says loaded the unload status is returned anyway.
     """
     t0 = now()
     if health(cfg) is None:
@@ -87,8 +94,9 @@ def pause(
             log(f"strata: unload answered '{result}' (try {tries})")
             break
         if code == 0:
-            log(f"strata: stopped answering during unload (try {tries})")
-            return {"status": "absent", "paused_s": now() - t0, "tries": tries}
+            error = "unload request got no answer"
+            log(f"strata: {error} (try {tries})")
+            return {"status": "error", "error": error, "paused_s": now() - t0, "tries": tries}
         busy = code == 409 or (code == 200 and isinstance(body, dict) and body.get("status") == "busy")
         if not busy:
             error = f"unload answered HTTP {code}" + (f": {_short(body)}" if body else "")
@@ -103,12 +111,13 @@ def pause(
     poll_start = now()
     while True:
         current = health(cfg)
-        if current is None:
-            log("strata: stopped answering while unloading")
-            return {"status": "absent", "paused_s": now() - t0, "tries": tries}
-        if not current.get("loaded"):
+        if current is not None and not current.get("loaded"):
             break
         if now() - poll_start >= UNLOAD_POLL_MAX_S:
+            if current is None:
+                error = "health stopped answering after unload"
+                log(f"strata: {error}")
+                return {"status": "error", "error": error, "paused_s": now() - t0, "tries": tries}
             log(f"strata: still reports loaded {UNLOAD_POLL_MAX_S} s after the unload, going on")
             break
         sleep(UNLOAD_POLL_S)

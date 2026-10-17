@@ -66,6 +66,46 @@ def test_pause_stops_on_a_server_error_after_a_busy_answer(strata_factory, clock
     assert clock.sleeps == [60]
 
 
+def test_pause_errors_when_the_unload_request_gets_no_answer(strata_factory, clock):
+    fake, cfg = strata_factory(unload_drop=True)
+    r = strata.pause(cfg, quiet, sleep=clock.sleep, now=clock.now)
+    assert r["status"] == "error" and r["error"] == "unload request got no answer"
+    assert r["tries"] == 1 and clock.sleeps == []  # no retry, and not "absent"
+    assert [c for c in fake.calls if c[1].startswith("/unload")] == [("POST", "/unload?wait=1")]
+
+
+def test_pause_keeps_polling_when_a_health_answer_is_lost(strata_factory, clock):
+    fake, cfg = strata_factory(health_drop_after_unload=1)
+    r = strata.pause(cfg, quiet, sleep=clock.sleep, now=clock.now)
+    assert r["status"] == "unloaded" and r["tries"] == 1 and r["paused_s"] == 1.0
+    assert clock.sleeps == [1]
+    assert fake.loaded is False
+
+
+def test_pause_keeps_polling_through_a_lost_answer_and_a_lagging_engine(strata_factory, clock):
+    fake, cfg = strata_factory(health_drop_after_unload=2, health_lag=2)
+    r = strata.pause(cfg, quiet, sleep=clock.sleep, now=clock.now)
+    assert r["status"] == "unloaded" and r["paused_s"] == 4.0
+    assert clock.sleeps == [1, 1, 1, 1]
+
+
+def test_pause_errors_when_health_never_answers_after_the_unload(strata_factory, clock):
+    fake, cfg = strata_factory(health_drop_after_unload=10_000)
+    r = strata.pause(cfg, quiet, sleep=clock.sleep, now=clock.now)
+    assert r["status"] == "error" and r["error"] == "health stopped answering after unload"
+    assert clock.sleeps == [1] * 60 and r["paused_s"] == 60.0 and r["tries"] == 1
+    assert fake.loaded is False  # the unload itself was acknowledged
+
+
+def test_pause_goes_on_when_health_still_says_loaded_after_60s(strata_factory, clock):
+    fake, cfg = strata_factory(health_lag=10_000)
+    logged = []
+    r = strata.pause(cfg, logged.append, sleep=clock.sleep, now=clock.now)
+    assert r["status"] == "unloaded" and r["paused_s"] == 60.0
+    assert clock.sleeps == [1] * 60
+    assert any("still reports loaded" in line for line in logged)
+
+
 def test_pause_reports_absent_when_nothing_answers(clock):
     cfg = StrataCfg(url="http://127.0.0.1:1")
     r = strata.pause(cfg, quiet, sleep=clock.sleep, now=clock.now)

@@ -50,9 +50,13 @@ class _Handler(BaseHTTPRequestHandler):
     def _serve(self, method: str) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
-        status, payload = self.server.owner._record_and_handle(
+        answer = self.server.owner._record_and_handle(
             method, self.path, Headers(self.headers.items()), body
         )
+        if answer is None:  # drop the connection without a response
+            self.close_connection = True
+            return
+        status, payload = answer
         data = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -104,7 +108,10 @@ class FakeServer:
             return self.handle(method, path, body)
 
     def handle(self, method: str, path: str, body: bytes):
-        """Return (status, payload); called with the lock held. A bytes payload is sent as is."""
+        """Return (status, payload), or None to drop the connection without an answer.
+
+        Called with the lock held. A bytes payload is sent as is.
+        """
         return 404, {"error": f"no route: {method} {path}"}
 
 
@@ -116,6 +123,9 @@ class FakeStrata(FakeServer):
     load_fails: /load answers 503 instead of loading.
     unload_status: when set, /unload answers this HTTP code with an error body (a wrong key, a crash),
         after any busy_times 409s.
+    unload_drop: /unload drops the connection without answering (a timeout or a crashed request).
+    health_drop_after_unload: after an acknowledged /unload, this many /health calls are dropped
+        without an answer before it recovers.
     health_lag: after an /unload or /load, /health keeps reporting the old `loaded` value for this
         many calls (the engine takes a moment to go away or come up); `.loaded` is the real state.
     absent: nothing is listening; start() starts no server and returns a URL nobody answers on.
@@ -131,6 +141,8 @@ class FakeStrata(FakeServer):
         load_fails: bool = False,
         health_lag: int = 0,
         unload_status: int | None = None,
+        unload_drop: bool = False,
+        health_drop_after_unload: int = 0,
     ) -> None:
         super().__init__()
         self.busy_times = busy_times
@@ -139,6 +151,9 @@ class FakeStrata(FakeServer):
         self.load_fails = load_fails
         self.health_lag = health_lag
         self.unload_status = unload_status
+        self.unload_drop = unload_drop
+        self.health_drop_after_unload = health_drop_after_unload
+        self._health_drops_left = 0
         self._stale = loaded
         self._lag_left = 0
 
@@ -160,6 +175,9 @@ class FakeStrata(FakeServer):
     def handle(self, method, path, body):
         route = path.split("?", 1)[0]
         if method == "GET" and route == "/health":
+            if self._health_drops_left > 0:
+                self._health_drops_left -= 1
+                return None
             return 200, {
                 "status": "ok",
                 "loaded": self._reported_loaded(),
@@ -169,6 +187,8 @@ class FakeStrata(FakeServer):
         if method == "GET" and route == "/status":
             return 200, {"busy": False, "queued": 0, "phase": "idle"}
         if method == "POST" and route == "/unload":
+            if self.unload_drop:
+                return None
             if self.busy_times > 0:
                 self.busy_times -= 1
                 return 409, {"status": "busy"}
@@ -176,6 +196,7 @@ class FakeStrata(FakeServer):
                 return self.unload_status, {"error": {"message": "nope"}}
             was_loaded = self.loaded
             self._transition(False)
+            self._health_drops_left = self.health_drop_after_unload
             return 200, {"status": "unloaded" if was_loaded else "not loaded"}
         if method == "POST" and route == "/load":
             if self.load_fails:
