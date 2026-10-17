@@ -1,4 +1,4 @@
-"""Process helpers: detached spawn, pid liveness, killing a process tree, port listeners.
+"""Process helpers: detached spawn, pid liveness, killing a process tree, stopping pids, port listeners.
 
 Standard library only. Windows is the primary platform (ctypes + taskkill/netstat);
 the POSIX branches are deliberately minimal.
@@ -9,9 +9,12 @@ from __future__ import annotations
 import functools
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from urllib.parse import urlsplit
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -26,6 +29,8 @@ STILL_ACTIVE = 259
 ERROR_ACCESS_DENIED = 5
 
 _KILL_WAIT_SECONDS = 3.0
+STOP_WAIT_ROUNDS = 20  # stop_pids gives a terminated process 20 x 0.5 s = 10 s to exit
+STOP_POLL_S = 0.5
 
 
 def _run_quiet(argv: list[str], timeout: float = 30) -> str:
@@ -138,8 +143,6 @@ def kill_tree(pid: int) -> bool:
             time.sleep(0.05)
         return not pid_alive(pid)
 
-    import signal
-
     delivered = False
     for send in (os.killpg, os.kill):
         try:
@@ -148,6 +151,53 @@ def kill_tree(pid: int) -> bool:
         except OSError:
             pass
     return delivered or not pid_alive(pid)
+
+
+def _terminate(pid: int, proc: subprocess.Popen | None) -> None:
+    try:
+        if proc is not None and proc.pid == pid:
+            proc.terminate()
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass  # already gone, or not ours to end: kill_tree settles it
+
+
+def _alive(pid: int, proc: subprocess.Popen | None) -> bool:
+    if proc is not None and proc.pid == pid:
+        return proc.poll() is None  # also reaps the child, which pid_alive would still see
+    return pid_alive(pid)
+
+
+def stop_pids(
+    pids: list[int],
+    sleep: Callable[[float], None] | None = None,
+    proc: subprocess.Popen | None = None,
+) -> bool:
+    """End each pid and everything it started; True when kill_tree reports every one gone.
+
+    On Windows terminating is not graceful (TerminateProcess), and the parent dying first would
+    orphan its children, so the process tree is killed at once. Elsewhere each pid is sent SIGTERM,
+    all of them get up to 10 s (20 polls of `sleep(0.5)`) to exit, and the trees are killed after
+    that. kill_tree always runs for every pid (it is True for one that is already gone).
+
+    proc, when given, is the Popen of one of the pids: it is terminated and polled through the
+    Popen object (a child that exited is a zombie that pid_alive still sees) and its exit status is
+    collected at the end, so no zombie or ResourceWarning is left behind. `sleep` defaults to
+    time.sleep, looked up on each call so a patched time.sleep is honoured.
+    """
+    sleep = sleep or time.sleep
+    if not IS_WINDOWS:
+        for pid in pids:
+            _terminate(pid, proc)
+        for _ in range(STOP_WAIT_ROUNDS):
+            if not any(_alive(pid, proc) for pid in pids):
+                break
+            sleep(STOP_POLL_S)
+    gone = [bool(kill_tree(pid)) for pid in pids]  # every pid, even after one fails
+    if proc is not None:
+        proc.poll()  # collect the exit status
+    return all(gone)
 
 
 def _netstat() -> str:
@@ -188,3 +238,9 @@ def listener_pids(port: int) -> list[int]:
             if found_pid not in found:
                 found.append(found_pid)
     return found
+
+
+def url_port(url: str) -> int:
+    """The TCP port a URL points at: the explicit one, else 443 for https and 80 for the rest."""
+    parts = urlsplit(url)
+    return parts.port or (443 if parts.scheme == "https" else 80)

@@ -100,3 +100,29 @@ def test_kill_tree_also_ends_grandchildren(tmp_path):
             parent.wait(10)
         if grandchild:
             procs.kill_tree(grandchild)
+
+
+def test_stop_pids_ends_every_process_and_says_so():
+    kids = [
+        procs.spawn_detached([sys.executable, "-c", "import time; time.sleep(60)"], None, os.devnull)
+        for _ in range(2)
+    ]
+    try:
+        assert procs.stop_pids([k.pid for k in kids]) is True
+        for kid in kids:
+            kid.wait(10)
+            assert not procs.pid_alive(kid.pid)
+    finally:
+        for kid in kids:
+            if kid.poll() is None:
+                kid.kill()
+                kid.wait(10)
+
+
+def test_stop_pids_reports_false_for_a_pid_that_will_not_die(monkeypatch):
+    killed = []
+    monkeypatch.setattr(procs, "kill_tree", lambda pid: killed.append(pid) or pid == 2)
+    monkeypatch.setattr(procs, "pid_alive", lambda pid: False)  # POSIX: nothing to wait for
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+    assert procs.stop_pids([1, 2]) is False
+    assert killed == [1, 2]  # the second is still tried after the first fails

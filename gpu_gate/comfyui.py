@@ -15,20 +15,16 @@ import json
 import locale
 import os
 import re
-import signal
 import subprocess
 import time
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit
 
 from . import http, procs
 from .config import ComfyCfg
 
 READY_POLL_S = 1.0  # how often wait_ready asks /system_stats
 WAIT_POLL_S = 1.5  # how often wait asks /history
-STOP_WAIT_ROUNDS = 20  # stop gives a terminated process 20 x 0.5 s = 10 s to exit
-STOP_POLL_S = 0.5
 SUBMIT_TIMEOUT_S = 30  # ComfyUI validates the whole workflow before it answers /prompt
 FREE_TIMEOUT_S = 30
 OUTPUT_KEYS = ("images", "gifs", "videos", "audio")  # the keys of a history output that hold files
@@ -406,27 +402,6 @@ def delete_pending(cfg: ComfyCfg, prompt_ids: list[str]) -> bool:
 # --- stopping ----------------------------------------------------------------------------------
 
 
-def _port(url: str) -> int:
-    parts = urlsplit(url)
-    return parts.port or (443 if parts.scheme == "https" else 80)
-
-
-def _terminate(pid: int, proc: subprocess.Popen | None) -> None:
-    try:
-        if proc is not None and proc.pid == pid:
-            proc.terminate()
-        else:
-            os.kill(pid, signal.SIGTERM)
-    except OSError:
-        pass  # already gone, or not ours to end: kill_tree settles it
-
-
-def _alive(pid: int, proc: subprocess.Popen | None) -> bool:
-    if proc is not None and proc.pid == pid:
-        return proc.poll() is None  # also reaps the child, which pid_alive would still see
-    return procs.pid_alive(pid)
-
-
 def stop(
     cfg: ComfyCfg,
     proc: subprocess.Popen | None,
@@ -435,32 +410,18 @@ def stop(
 ) -> dict:
     """End ComfyUI and everything it started.
 
-    The process is proc when given, else whatever listens on the port of cfg.url. On Windows
-    terminating is not graceful (TerminateProcess), and the parent dying first would orphan its
-    children, so the process tree is killed at once. Elsewhere the process is terminated, given 10 s
-    to exit, and the tree is killed after that. kill_tree always runs for every pid (it is True for
-    one that is already gone).
+    The process is proc when given, else whatever listens on the port of cfg.url. How it is ended
+    (and how long it is given) is procs.stop_pids's rule.
 
     Returns {"stopped", "pids"}: pids are the processes aimed at (empty when nothing was running,
     which is not "stopped"); stopped is True when there was at least one and kill_tree reports every
     one gone.
     """
-    sleep = sleep or time.sleep  # looked up here so a patched time.sleep is honoured
-    pids = [proc.pid] if proc is not None else procs.listener_pids(_port(cfg.url))
+    pids = [proc.pid] if proc is not None else procs.listener_pids(procs.url_port(cfg.url))
     if not pids:
         log("comfyui: nothing to stop")
         return {"stopped": False, "pids": []}
     log(f"comfyui: stopping pids {pids}")
-    if not procs.IS_WINDOWS:
-        for pid in pids:
-            _terminate(pid, proc)
-        for _ in range(STOP_WAIT_ROUNDS):
-            if not any(_alive(pid, proc) for pid in pids):
-                break
-            sleep(STOP_POLL_S)
-    gone = [bool(procs.kill_tree(pid)) for pid in pids]  # every pid, even after one fails
-    if proc is not None:
-        proc.poll()  # collect the exit status: no zombie, no ResourceWarning
-    stopped = all(gone)
+    stopped = procs.stop_pids(pids, sleep, proc)
     log("comfyui: stopped" if stopped else f"comfyui: could not stop pids {pids}")
     return {"stopped": stopped, "pids": pids}
