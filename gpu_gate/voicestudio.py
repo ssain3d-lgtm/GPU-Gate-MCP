@@ -117,8 +117,10 @@ def run_batch(
 
     jobs go to <work_dir>/voice_jobs.json (UTF-8) and the script runs as
     `python <cfg.batch_script> <that file>` in cfg.dir (else work_dir), its output appended to
-    <work_dir>/voice_batch.log. Its environment is ours plus VOICESTUDIO_URL=cfg.url and, when cfg.dir
-    is set, VOICESTUDIO_ROOT=cfg.dir. work_dir must exist.
+    <work_dir>/voice_batch.log. Its environment is ours plus VOICESTUDIO_URL=cfg.url, when cfg.dir is
+    set VOICESTUDIO_ROOT=cfg.dir, and PYTHONUTF8=1 (always, whatever we were started with): a script
+    that opens the jobs file without an encoding would otherwise read UTF-8 as the Windows code page
+    (cp949 on a Korean install). work_dir must exist.
 
     The script is watched every 0.5 s until it exits, timeout_s passes or cancelled() turns true; the
     last two kill it and its process tree. One result per job, in order:
@@ -135,6 +137,7 @@ def run_batch(
     cwd = cfg.dir or work_dir
     env = dict(os.environ)
     env["VOICESTUDIO_URL"] = cfg.url
+    env["PYTHONUTF8"] = "1"
     if cfg.dir:
         env["VOICESTUDIO_ROOT"] = cfg.dir
     argv = [sys.executable, script, jobs_path]

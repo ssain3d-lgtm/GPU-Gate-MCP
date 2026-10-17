@@ -23,6 +23,7 @@ with open(jobs_path, encoding="utf-8") as f:
 dump = {
     "url": os.environ.get("VOICESTUDIO_URL"),
     "root": os.environ.get("VOICESTUDIO_ROOT"),
+    "utf8": os.environ.get("PYTHONUTF8"),
     "cwd": os.getcwd(),
     "argv": sys.argv[1:],
 }
@@ -117,10 +118,11 @@ def test_run_batch_resolves_a_relative_out_against_the_script_cwd(work_dir, cfg,
     assert os.path.isfile(expected)
 
 
-def test_run_batch_passes_url_and_root_env(work_dir, cfg, lines):
+def test_run_batch_passes_url_and_root_env(work_dir, cfg, lines, monkeypatch):
+    monkeypatch.setenv("PYTHONUTF8", "0")  # forced to 1 whatever we were started with
     voicestudio.run_batch(cfg, [], str(work_dir), 60, never, lines.append)
     dump = json.loads((work_dir / "env_dump.json").read_text())
-    assert dump["url"] == cfg.url and dump["root"] == cfg.dir
+    assert dump["url"] == cfg.url and dump["root"] == cfg.dir and dump["utf8"] == "1"
     assert os.path.samefile(dump["cwd"], cfg.dir)
     assert dump["argv"] == [str(work_dir / "voice_jobs.json")]
 
