@@ -139,6 +139,18 @@ def test_command_bat_override_must_be_an_existing_bare_file_name(tmp_path, name)
     with pytest.raises(ValueError) as e:
         comfyui.command(cfg, name)
     assert str(e.value) == f"comfy_variant not found: {name}"
+    assert comfyui.variant_error(cfg, name) == f"comfy_variant not found: {name}"
+
+
+def test_variant_error_accepts_what_command_accepts(tmp_path):
+    (tmp_path / "Start Other.bat").write_text("py ComfyUI\\main.py\r\n", encoding="utf-8")
+    cfg = ComfyCfg(dir=str(tmp_path), bat="Start ComfyUI.bat")
+    assert comfyui.variant_error(cfg, "Start Other.bat") is None
+    assert comfyui.variant_error(cfg, 7) == "comfy_variant not found: 7"
+    # A configured command wins over any bat, so command() never looks at the variant.
+    with_command = ComfyCfg(dir=str(tmp_path), command=["python", "main.py"])
+    assert comfyui.variant_error(with_command, "missing.bat") is None
+    assert comfyui.command(with_command, "missing.bat")[0] == ["python", "main.py"]
 
 
 # --- workflow files --------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 """The batch worker: one detached process runs one batch from start to end.
 
-    0 check the jobs and that no other LLM server is running (`options.force` overrides)
+    0 check the jobs, the `comfy_variant` option and that no other LLM server is running
+      (`options.force` overrides the last)
     1 pause Strata (unload its engine)
     2 start the executor (ComfyUI or VoiceStudio), or reuse the one that is already up (also one
       that holds its port but is still starting: it is waited for, never started a second time)
@@ -59,6 +60,7 @@ class Deps:
     strata_resume: Callable[[Log], dict]
     exec_ready: Callable[[], bool]
     exec_port_busy: Callable[[], bool]  # something listens on the executor's port (it may be starting)
+    exec_validate_variant: Callable[[Any], str | None]  # (comfy_variant) -> why it is refused, or None
     exec_start: Callable[..., Any]  # (log_path, log, bat_override=None) -> Popen
     exec_wait_ready: Callable[[Any, float], float | None]  # (proc, timeout_s)
     exec_submit: Callable[[dict, str], str]  # (workflow, client_id) -> prompt id
@@ -134,14 +136,21 @@ def _nothing_to_free() -> bool:
     return True
 
 
+def _no_variants(name: object) -> None:
+    """VoiceStudio has no start variants: nothing to refuse."""
+    return None
+
+
 def default_deps(cfg: config.Config, kind: str = "comfyui") -> Deps:
     """The real adapters, bound to cfg; the executor fields to ComfyUI or VoiceStudio by kind."""
     if kind == "comfyui":
         executor, ecfg = comfyui, cfg.comfyui
         free = functools.partial(comfyui.free, cfg.comfyui)
+        validate_variant = functools.partial(comfyui.variant_error, cfg.comfyui)
     elif kind == "voicestudio":
         executor, ecfg = voicestudio, cfg.voicestudio
         free = _nothing_to_free
+        validate_variant = _no_variants
     else:
         raise ValueError(f"unknown batch kind: {kind!r}")
     sleep, now = time.sleep, time.monotonic
@@ -152,6 +161,7 @@ def default_deps(cfg: config.Config, kind: str = "comfyui") -> Deps:
         strata_resume=functools.partial(strata.resume, cfg.strata, **clock),
         exec_ready=functools.partial(executor.ready, ecfg),
         exec_port_busy=functools.partial(_port_busy, ecfg.url),
+        exec_validate_variant=validate_variant,
         exec_start=functools.partial(executor.start, ecfg),
         exec_wait_ready=functools.partial(executor.wait_ready, ecfg, **clock),
         exec_submit=functools.partial(comfyui.submit, cfg.comfyui),
@@ -404,7 +414,7 @@ class _Run:
         state.write_lock(self.home, self.batch_id, os.getpid())
         self.doc.update(pid=os.getpid(), started=self.result["started"], finished=None, result=None)
 
-        if self._other_llm_blocks():
+        if self._variant_refused() or self._other_llm_blocks():
             self._skip_undecided()
             return self._finish()
         try:
@@ -428,6 +438,18 @@ class _Run:
                 self._transition("restoring")
                 self._resume()
         return self._finish()
+
+    def _variant_refused(self) -> bool:
+        """Step 0: a comfy_variant that step 2 would refuse ends the batch before Strata is unloaded
+        for nothing. An empty one means the configured bat, as in step 2."""
+        variant = self.options.get("comfy_variant")
+        if self.kind != "comfyui" or not variant:
+            return False
+        problem = self.deps.exec_validate_variant(variant)
+        if problem is None:
+            return False
+        self._fail(problem)
+        return True
 
     def _other_llm_blocks(self) -> bool:
         ports = self.deps.other_llm_alive(list(self.cfg.other_llm_ports))

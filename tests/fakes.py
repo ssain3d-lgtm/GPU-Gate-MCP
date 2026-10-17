@@ -351,6 +351,7 @@ def fake_deps(
     ready=None,
     port_busy: bool = False,
     proc_code: int | None = None,
+    variant_error: str | None = None,
     start_error: Exception | None = None,
     cold_start_s: float | None = 12.0,
     load_errors: dict | None = None,
@@ -371,6 +372,7 @@ def fake_deps(
     ready: a list of exec_ready answers in call order (the last one repeats); wins over comfy_running.
     port_busy: what exec_port_busy answers (something listens on the executor's port).
     proc_code: the exit code the started FakeProc reports (None = still running).
+    variant_error: what exec_validate_variant answers (None = the variant is fine).
     start_error: exec_start raises it. cold_start_s: what exec_wait_ready returns (None = never ready).
     load_errors: {workflow basename: exception} for exec_load_workflow. submit_error: every
         exec_submit raises it.
@@ -473,6 +475,7 @@ def fake_deps(
         "strata_resume": strata_resume,
         "exec_ready": exec_ready,
         "exec_port_busy": lambda: port_busy,
+        "exec_validate_variant": lambda name: variant_error,
         "exec_start": exec_start,
         "exec_wait_ready": lambda proc, timeout_s: cold_start_s,
         "exec_submit": exec_submit,

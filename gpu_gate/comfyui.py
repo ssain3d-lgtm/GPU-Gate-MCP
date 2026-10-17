@@ -128,15 +128,31 @@ def parse_bat(path: str) -> tuple[list[str], dict[str, str]]:
     raise ValueError(f"no python line with main.py in {path}")
 
 
+def variant_error(cfg: ComfyCfg, name: object) -> str | None:
+    """Why command() would refuse the variant name ("comfy_variant not found: <name>"), or None.
+
+    Checked before anything is touched, so a bad name does not cost an LLM unload. A configured
+    cfg.command wins over every bat, so then any name passes (command() ignores it).
+    """
+    if cfg.command:
+        return None
+    bare = (
+        isinstance(name, str) and bool(name)
+        and os.path.basename(name) == name and "\\" not in name
+    )
+    if not bare or not os.path.isfile(os.path.join(cfg.dir, name)):
+        return f"comfy_variant not found: {name}"
+    return None
+
+
 def _bat_path(cfg: ComfyCfg, bat_override: str | None) -> str:
     """cfg.bat in cfg.dir, or the bare file name bat_override naming another bat in that folder."""
     if not bat_override:
         return os.path.join(cfg.dir, cfg.bat)
-    bare = os.path.basename(bat_override) == bat_override and "\\" not in bat_override
-    path = os.path.join(cfg.dir, bat_override)
-    if not bare or not os.path.isfile(path):
-        raise ValueError(f"comfy_variant not found: {bat_override}")
-    return path
+    problem = variant_error(cfg, bat_override)
+    if problem:
+        raise ValueError(problem)
+    return os.path.join(cfg.dir, bat_override)
 
 
 def command(cfg: ComfyCfg, bat_override: str | None = None) -> tuple[list[str], dict, str | None]:

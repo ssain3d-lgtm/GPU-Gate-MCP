@@ -298,6 +298,25 @@ def test_comfy_variant_option_reaches_exec_start(home, cfg, log, wf):
     assert "exec_stop" not in names(deps)  # nothing was started, nothing to stop
 
 
+def test_bad_comfy_variant_fails_before_strata_is_touched(home, cfg, log, wf):
+    deps = fake_deps(variant_error="comfy_variant not found: Nope.bat")
+    r = worker.run_batch(home, batch([wf("a.json"), wf("b.json")], {"comfy_variant": "Nope.bat"}), cfg, deps, log)
+    assert names(deps) == ["exec_validate_variant"]
+    assert calls_to(deps, "exec_validate_variant")[0][1] == ("Nope.bat",)
+    assert r["error"] == "comfy_variant not found: Nope.bat" and r["ok"] is False
+    assert [j["status"] for j in r["jobs"]] == ["skipped", "skipped"]
+    assert r["strata"] == {"server": None, "paused_s": None, "restored": None, "load_s": None}
+
+    # Without a variant, or for a voice batch, nothing is validated.
+    deps = fake_deps(variant_error="never asked")
+    assert worker.run_batch(home, batch([wf("a.json")]), cfg, deps, log)["ok"]
+    assert "exec_validate_variant" not in names(deps)
+    deps = fake_deps(variant_error="never asked")
+    voice = batch([{"text": "hi", "out": "a.wav"}], {"comfy_variant": "x.bat"}, kind="voicestudio")
+    assert worker.run_batch(home, voice, cfg, deps, log)["ok"]
+    assert "exec_validate_variant" not in names(deps)
+
+
 def test_exception_mid_batch_still_cleans_up_and_resumes(home, cfg, log, logs, wf):
     deps = fake_deps(submit_error=RuntimeError("boom\nsecond line"))
     r = worker.run_batch(home, batch([wf("a.json")]), cfg, deps, log)
@@ -516,6 +535,7 @@ def test_default_deps_binds_the_adapters_by_kind(cfg):
     assert d.strata_pause.func is strata.pause and d.strata_resume.func is strata.resume
     assert d.exec_ready.func is comfyui.ready and d.exec_ready.args == (cfg.comfyui,)
     assert d.exec_port_busy.func is worker._port_busy and d.exec_port_busy.args == (cfg.comfyui.url,)
+    assert d.exec_validate_variant.func is comfyui.variant_error and d.exec_validate_variant.args == (cfg.comfyui,)
     assert d.exec_start.func is comfyui.start and d.exec_wait_ready.func is comfyui.wait_ready
     assert d.exec_submit.func is comfyui.submit and d.exec_wait.func is comfyui.wait
     assert d.exec_free.func is comfyui.free and d.exec_stop.func is comfyui.stop
@@ -529,6 +549,7 @@ def test_default_deps_binds_the_adapters_by_kind(cfg):
     assert v.exec_stop.func is voicestudio.stop
     assert v.voice_run_batch.func is voicestudio.run_batch and v.voice_run_batch.args == (cfg.voicestudio,)
     assert v.exec_free() is True  # VoiceStudio has no /free; its batch script unloads the model
+    assert v.exec_validate_variant("anything.bat") is None  # VoiceStudio has no variants
 
     with pytest.raises(ValueError):
         worker.default_deps(cfg, "blender")

@@ -28,7 +28,7 @@ GPU-Gate-MCP 는 이 순서 전체를 도구 호출 하나로 묶는다. 에이�
 
 한 배치는 별도 워커 프로세스에서 다음 순서로 진행된다.
 
-0. **점검** — 잡 목록을 확인하고, `other_llm_ports` 의 다른 LLM 서버가 응답하면 배치를 거부한다(`force` 로 무시할 수 있다).
+0. **점검** — 잡 목록과 `comfy_variant` 옵션(그 `.bat` 이 `comfyui.dir` 에 있는지)을 확인하고, `other_llm_ports` 의 다른 LLM 서버가 응답하면 배치를 거부한다(`force` 로 무시할 수 있다). 여기서 거부되면 Strata 는 건드리지 않는다.
 1. **Strata 내리기** — 진행 중인 응답(턴)이 끝나기를 기다렸다가 `POST /unload?wait=1` 로 엔진을 내린다. 서버가 바쁘면 1분마다 다시 시도하고, 15분이 지나도 바쁘면 `strata pause failed: busy` 로 배치를 포기한다(LLM 은 건드리지 않은 상태 그대로).
 2. **실행기 시작** — ComfyUI(또는 VoiceStudio)를 사용자의 시작 스크립트로 띄우고 응답할 때까지 기다린다. 이미 떠 있으면 그것을 쓴다.
 3. **잡 실행** — 잡을 순서대로 실행한다. 연달은 워크플로우는 한 묶음으로 큐에 넣고 순서대로 기다리며, 명령(command) 잡은 앞선 잡이 모두 끝난 뒤 하나씩 실행한다.
@@ -285,7 +285,7 @@ ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경�
 | `worker died; see <로그>` | 워커가 결과 없이 사라졌다. 로그 파일을 열어 마지막 줄을 본다. LLM 은 서버가 다시 올려 둔다. |
 | `config not found: ... run: python gpu_gate_server.py --init` | 설정이 없다. `--init` 으로 만들고 고친 뒤 `--selftest`. |
 | `<키> does not exist: <경로>` 등 설정 오류 | 메시지의 키와 파일을 고친다. 쓰지 않는 VoiceStudio 는 `voicestudio` 절을 지운다. |
-| 결과 `error`: `comfy_variant not found: <이름>` | `comfyui.dir` 안에 그 이름의 `.bat` 이 없다(파일 이름만 쓴다). |
+| 결과 `error`: `comfy_variant not found: <이름>` | `comfyui.dir` 안에 그 이름의 `.bat` 이 없다(파일 이름만 쓴다). LLM 을 내리기 전에 확인하므로 LLM 은 그대로다. |
 | 잡 `error`: `not an API-format workflow (save with 'Export (API)')` | UI 형식으로 저장한 워크플로우다. ComfyUI 에서 **Export (API)** 로 다시 저장한다. |
 | 잡 `error`: `workflow file not found: <경로>` | 경로가 게이트가 도는 PC 에서 존재하지 않는다. 절대 경로를 넘긴다. |
 | 결과 `error`: `strata pause failed: busy` | Strata 가 긴 생성을 하고 있었다. 게이트는 응답이 끝나기를 15분까지 기다린 뒤 포기하며, 이때 LLM 은 건드리지 않았다. 나중에 다시 부른다. |
