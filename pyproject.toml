@@ -1,0 +1,12 @@
+[project]
+name = "gpu-gate-mcp"
+version = "0.1.0"
+description = "MCP stdio server that unloads a local LLM server around ComfyUI/VoiceStudio GPU batches, then reloads it."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

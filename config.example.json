@@ -1,0 +1,28 @@
+{
+  "strata": {
+    "url": "http://127.0.0.1:8080",
+    "api_key": null,
+    "unload_wait_s": 300,
+    "load_timeout_s": 400
+  },
+  "comfyui": {
+    "dir": "C:/ComfyUI",
+    "bat": "Start ComfyUI.bat",
+    "command": null,
+    "url": "http://127.0.0.1:8188",
+    "start_timeout_s": 300,
+    "output_dir": null
+  },
+  "voicestudio": {
+    "dir": "C:/VoiceStudio/app",
+    "start_script": "C:/VoiceStudio/start_backend.ps1",
+    "batch_script": "C:/VoiceStudio/voice_batch.py",
+    "url": "http://127.0.0.1:3900",
+    "start_timeout_s": 180
+  },
+  "limits": {
+    "job_timeout_s": 1800,
+    "batch_timeout_s": 9000
+  },
+  "other_llm_ports": [8081]
+}
