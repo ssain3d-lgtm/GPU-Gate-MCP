@@ -19,15 +19,21 @@ GPU-Gate 는 stdio MCP 서버다. 클라이언트가 `python <repo>/gpu_gate_ser
 
 ## opencode
 
-`opencode.jsonc` 의 최상위 `"mcp": { ... }` 객체 안에 넣는다.
+opencode v2 의 `opencode.jsonc` 에서는 서버 항목이 `mcp.servers` 아래에 들어간다. 이미 있는 `"mcp": { "servers": { ... } }` 안에 `gpu-gate` 항목을 더한다.
 
 ```jsonc
-"gpu-gate": {
-  "type": "local",
-  "command": ["python", "<repo>/gpu_gate_server.py"],
-  "timeout": {"startup": 30000}
+"mcp": {
+  "servers": {
+    "gpu-gate": {
+      "type": "local",
+      "command": ["python", "<repo>/gpu_gate_server.py"],
+      "timeout": {"startup": 30000}
+    }
+  }
 }
 ```
+
+옛 opencode 1.x 는 항목을 `servers` 없이 `"mcp": { ... }` 바로 아래에 넣었다(지금은 쓰지 않는 형식). 항목 본문(`type`, `command`, `timeout`)은 어느 쪽이든 같다.
 
 끄려면 같은 항목에 `"disabled": true` 를 더한다.
 
