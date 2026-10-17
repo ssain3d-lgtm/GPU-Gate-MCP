@@ -114,6 +114,8 @@ class FakeStrata(FakeServer):
     busy_times: the first N /unload calls answer 409 {"status": "busy"}.
     loaded: whether the engine starts loaded.
     load_fails: /load answers 503 instead of loading.
+    unload_status: when set, /unload answers this HTTP code with an error body (a wrong key, a crash),
+        after any busy_times 409s.
     health_lag: after an /unload or /load, /health keeps reporting the old `loaded` value for this
         many calls (the engine takes a moment to go away or come up); `.loaded` is the real state.
     absent: nothing is listening; start() starts no server and returns a URL nobody answers on.
@@ -128,6 +130,7 @@ class FakeStrata(FakeServer):
         loaded: bool = True,
         load_fails: bool = False,
         health_lag: int = 0,
+        unload_status: int | None = None,
     ) -> None:
         super().__init__()
         self.busy_times = busy_times
@@ -135,6 +138,7 @@ class FakeStrata(FakeServer):
         self.loaded = loaded
         self.load_fails = load_fails
         self.health_lag = health_lag
+        self.unload_status = unload_status
         self._stale = loaded
         self._lag_left = 0
 
@@ -168,6 +172,8 @@ class FakeStrata(FakeServer):
             if self.busy_times > 0:
                 self.busy_times -= 1
                 return 409, {"status": "busy"}
+            if self.unload_status is not None:
+                return self.unload_status, {"error": {"message": "nope"}}
             was_loaded = self.loaded
             self._transition(False)
             return 200, {"status": "unloaded" if was_loaded else "not loaded"}

@@ -49,6 +49,23 @@ def test_pause_gives_up_after_900s_of_busy(strata_factory, clock):
     assert fake.loaded is True
 
 
+def test_pause_stops_on_unexpected_answer(strata_factory, clock):
+    fake, cfg = strata_factory(unload_status=401)
+    r = strata.pause(cfg, quiet, sleep=clock.sleep, now=clock.now)
+    assert r["status"] == "error" and r["tries"] == 1
+    assert "401" in r["error"] and "nope" in r["error"] and "test-key" not in r["error"]
+    assert clock.sleeps == []
+    assert fake.loaded is True
+    assert [c for c in fake.calls if c[1].startswith("/unload")] == [("POST", "/unload?wait=1")]
+
+
+def test_pause_stops_on_a_server_error_after_a_busy_answer(strata_factory, clock):
+    fake, cfg = strata_factory(busy_times=1, unload_status=500)
+    r = strata.pause(cfg, quiet, sleep=clock.sleep, now=clock.now)
+    assert r["status"] == "error" and r["tries"] == 2 and "500" in r["error"]
+    assert clock.sleeps == [60]
+
+
 def test_pause_reports_absent_when_nothing_answers(clock):
     cfg = StrataCfg(url="http://127.0.0.1:1")
     r = strata.pause(cfg, quiet, sleep=clock.sleep, now=clock.now)

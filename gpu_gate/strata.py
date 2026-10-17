@@ -48,9 +48,15 @@ def _post(cfg: StrataCfg, path: str, timeout: float) -> tuple[int, object | None
     )
 
 
+def _short(body: object | None, limit: int = 200) -> str:
+    """A body for a log line or error message: one line, cut at limit characters."""
+    text = " ".join(str(body).split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
 def _detail(code: int, body: object | None) -> str:
     """'HTTP 503 {...}' for the logs and error messages."""
-    return f"HTTP {code}" + (f" {body}" if body else "")
+    return f"HTTP {code}" + (f" {_short(body)}" if body else "")
 
 
 def pause(
@@ -61,9 +67,11 @@ def pause(
 ) -> dict:
     """Unload Strata's engine so the GPU is free.
 
-    Returns {"status": "unloaded" | "not loaded" | "absent" | "busy", "paused_s", "tries"}.
-    A server that is running a request answers 409; it is asked again every 60 s and given up on
-    ("busy") after 900 s in total.
+    Returns {"status": "unloaded" | "not loaded" | "absent" | "busy" | "error", "paused_s", "tries"}
+    plus an "error" message when the status is "error".
+    A server that is running a request answers 409 (or 200 {"status": "busy"}); it is asked again
+    every 60 s and given up on ("busy") after 900 s in total. Any other answer (a wrong api key,
+    a server error) returns at once as "error"; no answer at all is "absent".
     """
     t0 = now()
     if health(cfg) is None:
@@ -81,10 +89,15 @@ def pause(
         if code == 0:
             log(f"strata: stopped answering during unload (try {tries})")
             return {"status": "absent", "paused_s": now() - t0, "tries": tries}
+        busy = code == 409 or (code == 200 and isinstance(body, dict) and body.get("status") == "busy")
+        if not busy:
+            error = f"unload answered HTTP {code}" + (f": {_short(body)}" if body else "")
+            log(f"strata: {error}")
+            return {"status": "error", "error": error, "paused_s": now() - t0, "tries": tries}
         if now() - t0 >= BUSY_GIVE_UP_S:
-            log(f"strata: still busy after {now() - t0:.0f} s and {tries} tries ({_detail(code, body)}), giving up")
+            log(f"strata: still busy after {now() - t0:.0f} s and {tries} tries, giving up")
             return {"status": "busy", "paused_s": now() - t0, "tries": tries}
-        log(f"strata: unload refused ({_detail(code, body)}), retrying in {BUSY_RETRY_S} s (try {tries})")
+        log(f"strata: busy, retrying the unload in {BUSY_RETRY_S} s (try {tries})")
         sleep(BUSY_RETRY_S)
 
     poll_start = now()
