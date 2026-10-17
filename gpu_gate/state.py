@@ -36,7 +36,7 @@ FINISHED_STATES = ("done", "failed", "aborted")
 _SHARING_TRIES = 10
 _SHARING_PAUSE_SECONDS = 0.05
 
-_IDLE_STATE ={"state": "idle", "batch_id": None, "updated": None, "last_result": None}
+_IDLE_STATE = {"state": "idle", "batch_id": None, "updated": None, "last_result": None}
 
 
 @dataclass(frozen=True)

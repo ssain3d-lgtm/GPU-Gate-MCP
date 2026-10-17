@@ -225,7 +225,7 @@ def load(home: Path | str) -> Config:
         text = file.read_text(encoding="utf-8-sig")  # tolerate a BOM from Windows editors
     except FileNotFoundError:
         raise ConfigError(
-            f"config not found: {file} — run: python gpu_gate_server.py --init"
+            f"config not found: {file} - run: python gpu_gate_server.py --init"
         ) from None
     except (OSError, ValueError) as err:
         raise ConfigError(f"config could not be read: {file} ({err})") from err

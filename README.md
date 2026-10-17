@@ -236,7 +236,7 @@ ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경�
 | 오류 | 뜻 |
 |---|---|
 | `busy` (+ `batch`) | 다른 배치가 돌고 있다. `batch` 에 그 배치의 id·pid·진행이 있다. |
-| `config not found: <경로> — run: python gpu_gate_server.py --init` 등 | 설정이 없거나 잘못됐다. 메시지가 키와 파일을 댄다. |
+| `config not found: <경로> - run: python gpu_gate_server.py --init` 등 | 설정이 없거나 잘못됐다. 메시지가 키와 파일을 댄다. |
 | `worker died; see <로그>` | 워커가 결과를 쓰기 전에 사라졌다. 서버가 배치를 `aborted` 로 표시하고, LLM 이 내려가 있으면 다시 올린다. |
 | `could not start the worker: ...` | 워커 프로세스를 띄우지 못했다. |
 | `batch <id> ended without a result (state …); see <로그>` | 워커가 배치를 끝냈다고 표시했지만 결과를 남기지 않았다. 로그를 본다. |

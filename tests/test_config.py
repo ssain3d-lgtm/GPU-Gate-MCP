@@ -42,6 +42,8 @@ def test_missing_config_names_the_path(tmp_path):
     with pytest.raises(config.ConfigError) as e:
         config.load(tmp_path)
     assert str(tmp_path / "config.json") in str(e.value) and "--init" in str(e.value)
+    # Plain ASCII around the path, so a cp949 console with redirected stderr prints it as is.
+    assert str(e.value) == f"config not found: {tmp_path / 'config.json'} - run: python gpu_gate_server.py --init"
 
 
 def test_example_config_loads_when_dirs_exist(tmp_path, example):

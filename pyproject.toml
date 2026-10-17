@@ -1,11 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "gpu-gate-mcp"
 version = "0.1.0"
 description = "MCP stdio server that unloads a local LLM server around ComfyUI/VoiceStudio GPU batches, then reloads it."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = []
+
+[tool.setuptools]
+packages = ["gpu_gate"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
