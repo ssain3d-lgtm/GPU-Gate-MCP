@@ -135,7 +135,7 @@ ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경�
 ```
 
 - 워크플로우는 ComfyUI 의 **Export (API)** 로 저장한 JSON 이어야 한다. 일반 저장(UI 형식)은 `not an API-format workflow (save with 'Export (API)')` 로 그 잡만 실패한다.
-- `command` 는 게이트가 직접 실행하는 프로그램이다(ComfyUI 가 켜져 있는 동안, 앞선 잡이 모두 끝난 뒤). 종료 코드 0 이면 `done`, 아니면 `error`(`exited <코드>`). `cwd` 가 있으면 존재해야 하고, `timeout_s` 가 없으면 `job_timeout_s` 를 쓴다. 출력은 로그에 쌓이고 `outputs` 는 비어 있다.
+- `command` 는 게이트가 직접 실행하는 프로그램이다(ComfyUI 가 켜져 있는 동안, 앞선 잡이 모두 끝난 뒤). 종료 코드 0 이면 `done`, 아니면 `error`(`exited <코드>`). `cwd` 가 있으면 존재해야 하고, `timeout_s` 가 없으면 `job_timeout_s` 를 쓴다. 출력은 로그에 쌓이고 `outputs` 는 비어 있다. 이 도구를 부를 수 있는 누구나 사용자 권한으로 아무 프로그램이나 실행할 수 있다(로컬 에이전트용 도구다).
 - 잡 하나가 잘못돼도(파일 없음 등) 그 잡만 `error` 가 되고 나머지는 계속 간다. 단 `stop_on_error` 이면 첫 오류 뒤는 건너뛴다.
 
 `options` (모두 선택):
@@ -204,7 +204,7 @@ ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경�
 | `log` | 이 배치의 로그 파일. |
 | `error` | 배치 단위의 실패 이유 한 줄(`other_llm_running: ports [8081]`, `strata pause failed: busy`, `comfyui not ready after 300 s` 등). 없으면 `null`. |
 
-결과와 로그에는 경로·숫자·짧은 문자열만 담긴다. 시작 `.bat` 의 환경변수 값이나 `strata.api_key` 는 들어가지 않는다.
+결과와 상태 파일(배치 파일, `state.json`)에는 경로·숫자·짧은 문자열만 담긴다. 시작 `.bat` 의 환경변수 값이나 `strata.api_key` 는 들어가지 않는다. 로그(`logs/<id>.log`)에는 실행기와 명령의 출력이 거르지 않고 그대로 쌓이며, `.bat` 에서 `set` 한 값을 가리는 것은 게이트가 쓰는 시작 줄(`comfyui: starting ...`)뿐이다.
 
 ### gate_status
 
@@ -224,9 +224,10 @@ ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경�
 - `state` 는 [상태값](#파일-규약) 중 하나다. 돌고 있는 배치가 있으면 그 배치의 상태, 없으면 `state.json` 의 값(처음에는 `idle`, 배치가 끝난 뒤에는 `done` 또는 `failed`). 워커가 죽은 채 남은 lock 이 있으면 `aborted` 와 경고를 보인다.
 - `batch` 는 돌고 있는 배치(없으면 `null`).
 - `strata` 의 `server` 는 응답 여부, `loaded`/`busy` 는 Strata 가 답한 값(모르면 `null`).
-- `executor` 값은 `down`, `up(gate)`(돌고 있는 배치가 띄운 것), `up(external)`(외부에서 띄운 것). 설정을 못 읽으면 `null`.
+- `executor` 값은 `down`, `up(gate)`(돌고 있는 배치가 쓰고 있는 것. 배치 도중에는 누가 띄웠는지 구분하지 못한다), `up(external)`(외부에서 띄운 것). 설정을 못 읽으면 `null`.
 - `gpu` 는 VRAM 을 300 MiB 이상 쓰는 프로세스 목록(큰 순서, Windows 의 성능 카운터로 읽음). 못 읽으면 `null`. LLM 이 올라와 있는 동안 다른 프로세스가 300 MiB 이상(데스크톱 창 관리자 `dwm` 은 3 GiB 초과) 잡고 있으면 경고를 남긴다.
 - 조회가 하나 실패해도 예외 대신 `warnings` 에 적고 나머지를 돌려준다.
+- 보고만 한다. 워커가 죽어 `aborted` 로 남은 배치 뒤에 LLM 이 내려가 있어도 `gate_status` 는 Strata 를 다시 올리지 않는다(다음 배치 호출이 올린다).
 
 ### 도구 오류
 
@@ -238,6 +239,7 @@ ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경�
 | `config not found: <경로> — run: python gpu_gate_server.py --init` 등 | 설정이 없거나 잘못됐다. 메시지가 키와 파일을 댄다. |
 | `worker died; see <로그>` | 워커가 결과를 쓰기 전에 사라졌다. 서버가 배치를 `aborted` 로 표시하고, LLM 이 내려가 있으면 다시 올린다. |
 | `could not start the worker: ...` | 워커 프로세스를 띄우지 못했다. |
+| `batch <id> ended without a result (state …); see <로그>` | 워커가 배치를 끝냈다고 표시했지만 결과를 남기지 않았다. 로그를 본다. |
 | `jobs: required`, `jobs: expected a non-empty array` 등 | 인자가 스키마에 맞지 않는다. |
 
 ## 파일 규약
