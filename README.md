@@ -9,7 +9,7 @@
 **Install.**
 
 ```
-git clone <repo-url> GPU-Gate-MCP && cd GPU-Gate-MCP
+git clone https://github.com/ssain3d-lgtm/GPU-Gate-MCP GPU-Gate-MCP && cd GPU-Gate-MCP
 python gpu_gate_server.py --init      # writes config.json; edit it for this machine
 python gpu_gate_server.py --selftest  # then register the server in your client (docs/clients.md)
 ```
@@ -43,7 +43,7 @@ Strata 가 처음부터 응답하지 않으면(`GET /health` 무응답) 1·5단�
 필요한 것: Python 3.10 이상(외부 패키지 없음), Strata(로컬 LLM 서버), ComfyUI 와 그 시작 `.bat`, 선택으로 VoiceStudio. 검증된 플랫폼은 Windows 이며 POSIX 분기는 있으나 확인하지 못했다.
 
 ```
-git clone <repo-url> GPU-Gate-MCP
+git clone https://github.com/ssain3d-lgtm/GPU-Gate-MCP GPU-Gate-MCP
 cd GPU-Gate-MCP
 python gpu_gate_server.py --init
 ```
