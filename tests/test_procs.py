@@ -1,7 +1,10 @@
+import json
 import os
 import subprocess
 import sys
 import time
+
+import pytest
 
 from gpu_gate import procs
 
@@ -153,3 +156,87 @@ def test_process_name_reads_proc_comm_off_windows(monkeypatch, tmp_path):
     monkeypatch.setattr(procs, "_COMM_PATH", str(tmp_path / "{pid}.comm"))
     assert procs.process_name(42) == "python3"
     assert procs.process_name(43) is None
+
+
+# --- the process table: find_pids / descendants ------------------------------------------------
+
+
+def _windows_table(monkeypatch, text):
+    """IS_WINDOWS on, _run_quiet answering text; the argv lists it was called with."""
+    seen = []
+    monkeypatch.setattr(procs, "IS_WINDOWS", True)
+    monkeypatch.setattr(procs, "_run_quiet", lambda argv, timeout=30, **kw: seen.append(argv) or text)
+    return seen
+
+
+def _cim(pid, ppid, command_line, exe=None):
+    return {"ProcessId": pid, "ParentProcessId": ppid, "CommandLine": command_line, "ExecutablePath": exe}
+
+
+def test_find_pids_reads_a_single_cim_object(monkeypatch):
+    # ConvertTo-Json writes one object, not a list, when only one process is listed. The bat starts
+    # ComfyUI with relative paths: the install folder shows only in the executable path.
+    text = json.dumps(_cim(
+        10720, 18968,
+        r".\python_embeded\python.exe -I -W ignore::FutureWarning ComfyUI\main.py --windows-standalone-build",
+        r"X:\Tools\Comfy Install\python_embeded\python.exe",
+    ))
+    seen = _windows_table(monkeypatch, text)
+    assert procs.find_pids(["MAIN.PY", "x:/tools/COMFY install"]) == [10720]
+    assert procs.find_pids(["main.py", r"X:\Tools\Comfy Install"]) == [10720]  # either slash
+    assert procs.find_pids(["main.py", "x:/tools/other"]) == []
+    argv = seen[0]
+    assert argv[:4] == ["powershell", "-NoProfile", "-NonInteractive", "-Command"]
+    assert "Get-CimInstance Win32_Process" in argv[4] and "ConvertTo-Json -Compress" in argv[4]
+
+
+def test_find_pids_reads_a_cim_list_and_skips_itself_and_its_parent(monkeypatch):
+    me, parent = os.getpid(), os.getppid()
+    text = json.dumps([
+        _cim(4, 0, None),  # System: no command line
+        _cim(me, parent, "python -m pytest backend.main uvicorn"),
+        _cim(parent, 1, "uvicorn backend.main --port 3900"),
+        _cim(500, 1, r"X:\venv\Scripts\python.exe -m UVICORN Backend.Main:app --port 3900", r"X:\venv\Scripts\python.exe"),
+        _cim(501, 500, r"X:\venv\Scripts\python.exe -m uvicorn other.app"),
+        _cim(502, 1, "uvicorn backend.main:app --reload"),
+    ])
+    _windows_table(monkeypatch, text)
+    assert procs.find_pids(["uvicorn", "backend.main"]) == [500, 502]
+
+
+def test_find_pids_is_empty_when_the_listing_fails(monkeypatch):
+    for text in ("", "not json", "[1, 2]", '{"ProcessId": "x"}'):
+        _windows_table(monkeypatch, text)
+        assert procs.find_pids(["main.py"]) == []
+
+
+def test_find_pids_reads_ps_off_windows(monkeypatch):
+    seen = []
+    text = (
+        "    1     0 /sbin/init\n"
+        "  300     1 /opt/comfy/venv/bin/python /opt/comfy/main.py --listen\n"
+        "  301   300 /opt/comfy/venv/bin/python -c pass\n"
+        "garbage line\n"
+    )
+    monkeypatch.setattr(procs, "IS_WINDOWS", False)
+    monkeypatch.setattr(procs, "_run_quiet", lambda argv, timeout=30, **kw: seen.append(argv) or text)
+    assert procs.find_pids(["main.py", "/OPT/comfy"]) == [300]
+    assert seen[0][0] == "ps"
+    assert procs.descendants(1) == [300, 301]
+
+
+def test_descendants_walks_the_whole_tree(monkeypatch):
+    text = json.dumps([
+        _cim(100, 1, "cmd"), _cim(200, 100, "a"), _cim(201, 100, "b"),
+        _cim(300, 200, "c"), _cim(400, 999, "d"), _cim(1, 0, "init"),
+    ])
+    _windows_table(monkeypatch, text)
+    assert sorted(procs.descendants(100)) == [200, 201, 300]
+    assert procs.descendants(400) == []
+
+
+def test_descendants_raises_when_the_listing_fails(monkeypatch):
+    # An empty answer would read as "no children"; the caller must be able to tell it apart.
+    _windows_table(monkeypatch, "")
+    with pytest.raises(OSError):
+        procs.descendants(100)

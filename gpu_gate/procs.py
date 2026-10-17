@@ -1,4 +1,5 @@
-"""Process helpers: detached spawn, pid liveness, killing a process tree, stopping pids, port listeners.
+"""Process helpers: detached spawn, pid liveness, killing a process tree, stopping pids, port listeners,
+the process table (find_pids by command line, descendants).
 
 Standard library only. Windows is the primary platform (ctypes + taskkill/netstat);
 the POSIX branches are deliberately minimal.
@@ -9,6 +10,7 @@ from __future__ import annotations
 import csv
 import functools
 import io
+import json
 import os
 import re
 import signal
@@ -37,8 +39,9 @@ STOP_POLL_S = 0.5
 _COMM_PATH = "/proc/{pid}/comm"
 
 
-def _run_quiet(argv: list[str], timeout: float = 30) -> str:
-    """Run a command without a console window; return its stdout text, or "" on any failure."""
+def _run_quiet(argv: list[str], timeout: float = 30, encoding: str | None = None) -> str:
+    """Run a command without a console window; return its stdout text (decoded with encoding, else
+    the locale's), or "" on any failure."""
     kwargs: dict = {}
     if IS_WINDOWS:
         kwargs["creationflags"] = CREATE_NO_WINDOW
@@ -49,6 +52,7 @@ def _run_quiet(argv: list[str], timeout: float = 30) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding=encoding,
             errors="replace",
             timeout=timeout,
             **kwargs,
@@ -263,6 +267,104 @@ def listener_pids(port: int) -> list[int]:
         for found_pid in pids:
             if found_pid not in found:
                 found.append(found_pid)
+    return found
+
+
+# Every process with its parent, command line and executable path, as JSON (UTF-8, so paths
+# outside the ANSI code page survive). ConvertTo-Json writes a lone object, not a list, for one row.
+_CIM_QUERY = (
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+    "Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CommandLine, ExecutablePath "
+    "| ConvertTo-Json -Compress"
+)
+_TABLE_TIMEOUT_S = 60
+
+
+def _parse_cim(text: str) -> list[tuple[int, int, str]]:
+    try:
+        rows = json.loads(text)
+    except ValueError:
+        return []
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return []
+    table = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pid, ppid = row.get("ProcessId"), row.get("ParentProcessId")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        words = " ".join(str(row.get(key) or "") for key in ("CommandLine", "ExecutablePath"))
+        table.append((pid, ppid if isinstance(ppid, int) else 0, words))
+    return table
+
+
+def _parse_ps(text: str) -> list[tuple[int, int, str]]:
+    table = []
+    for line in text.splitlines():
+        cols = line.split(None, 2)
+        if len(cols) >= 2 and cols[0].isdigit() and cols[1].isdigit():
+            table.append((int(cols[0]), int(cols[1]), cols[2] if len(cols) > 2 else ""))
+    return table
+
+
+def _process_table() -> list[tuple[int, int, str]]:
+    """(pid, parent pid, command line and executable path) of every process; [] on any failure.
+
+    Windows: one Win32_Process query through PowerShell. Elsewhere: `ps -eo pid=,ppid=,args=`.
+    """
+    try:
+        if IS_WINDOWS:
+            argv = ["powershell", "-NoProfile", "-NonInteractive", "-Command", _CIM_QUERY]
+            return _parse_cim(_run_quiet(argv, timeout=_TABLE_TIMEOUT_S, encoding="utf-8"))
+        return _parse_ps(_run_quiet(["ps", "-eo", "pid=,ppid=,args="], timeout=_TABLE_TIMEOUT_S))
+    except Exception:
+        return []
+
+
+def _fold(text: str) -> str:
+    """Lower case with forward slashes, so a path matches however its separators are written."""
+    return text.replace("\\", "/").lower()
+
+
+def find_pids(substrings: list[str]) -> list[int]:
+    """Pids of the processes whose command line contains every one of substrings, ignoring case and
+    `\\` versus `/`; [] on any failure. This process and its parent are never listed.
+
+    On Windows the executable path counts as part of the command line: a program started with a
+    relative path (`.\\python_embeded\\python.exe ComfyUI\\main.py`) shows its folder only there.
+    """
+    wanted = [_fold(s) for s in substrings]
+    skip = {os.getpid(), os.getppid()}
+    return [
+        pid for pid, _, words in _process_table()
+        if pid not in skip and all(w in _fold(words) for w in wanted)
+    ]
+
+
+def descendants(pid: int) -> list[int]:
+    """Every process started by pid, its children's children and so on (pid itself not included).
+
+    Raises OSError when the process list cannot be read: an empty list would mean "no children",
+    which a caller deciding whose process something is must not be told by mistake.
+    """
+    table = _process_table()
+    if not table:
+        raise OSError("the process list could not be read")
+    children: dict[int, list[int]] = {}
+    for child, parent, _ in table:
+        if child != parent:
+            children.setdefault(parent, []).append(child)
+    found: list[int] = []
+    seen, todo = {pid}, [pid]
+    while todo:
+        for child in children.get(todo.pop(), []):
+            if child not in seen:
+                seen.add(child)
+                found.append(child)
+                todo.append(child)
     return found
 
 
