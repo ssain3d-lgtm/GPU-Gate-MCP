@@ -326,6 +326,61 @@ def test_cancel_flag_skips_remaining_jobs_and_restores(home, cfg, log, wf):
     assert r["ok"] is False and r["strata"]["restored"]
 
 
+def test_cancel_before_the_executor_starts_runs_nothing_and_restores(home, cfg, log, wf):
+    # Esc during the pause: the executor is never started (no cold start for nothing).
+    b = batch(jobs=[wf("a.json"), wf("b.json")])
+    state.request_cancel(home, b["batch_id"])
+    deps = fake_deps()
+    r = worker.run_batch(home, b, cfg, deps, log)
+    assert names(deps) == ["other_llm_alive", "strata_health", "strata_pause", "strata_resume"]
+    assert [j["status"] for j in r["jobs"]] == ["cancelled", "cancelled"]
+    assert "cancelled before the executor started" in r["warnings"]
+    assert r["strata"]["restored"] is True and r["ok"] is False
+    assert r["executor"] == {"kind": "comfyui", "started_by_gate": False, "cold_start_s": None, "stopped": False}
+
+
+def test_cancel_while_the_gates_executor_starts_skips_the_jobs_and_stops_it(home, cfg, log, wf):
+    b = batch(jobs=[wf("a.json"), wf("b.json")])
+    deps = fake_deps()
+    wait_ready = deps.exec_wait_ready
+
+    def cancel_during_the_cold_start(proc, timeout_s):
+        state.request_cancel(home, b["batch_id"])
+        return wait_ready(proc, timeout_s)
+
+    deps.exec_wait_ready = cancel_during_the_cold_start
+    r = worker.run_batch(home, b, cfg, deps, log)
+    assert "exec_submit" not in names(deps) and "exec_wait" not in names(deps)
+    assert [j["status"] for j in r["jobs"]] == ["cancelled", "cancelled"]
+    assert "cancelled before the jobs started" in r["warnings"]
+    assert names(deps)[-4:] == ["exec_free", "exec_stop", "pid_vram_gone", "strata_resume"]
+    assert r["executor"]["started_by_gate"] is True and r["executor"]["stopped"] is True
+    assert r["strata"]["restored"] is True and r["ok"] is False
+
+
+def test_cancel_while_waiting_for_an_external_executor_ends_the_wait(home, cfg, log, wf):
+    # Someone else's ComfyUI holds the port but never answers: without the cancel the gate would
+    # wait start_timeout_s for it.
+    b = batch(jobs=[wf("a.json")])
+    deps = fake_deps(port_busy=True)
+    ready = deps.exec_ready
+
+    def cancel_on_the_third_look():
+        if names(deps).count("exec_ready") == 2:
+            state.request_cancel(home, b["batch_id"])
+        return ready()
+
+    deps.exec_ready = cancel_on_the_third_look
+    r = worker.run_batch(home, b, cfg, deps, log)
+    assert names(deps).count("exec_ready") == 3 and deps.clock.t < cfg.comfyui.start_timeout_s
+    assert [j["status"] for j in r["jobs"]] == ["cancelled"]
+    assert "cancelled before the executor started" in r["warnings"]
+    # It never answered, so executor_up stayed False: nothing is freed or stopped.
+    assert "exec_start" not in names(deps) and "exec_free" not in names(deps) and "exec_stop" not in names(deps)
+    assert names(deps)[-1] == "strata_resume" and r["strata"]["restored"] is True
+    assert r["error"] is None and r["ok"] is False
+
+
 def test_stop_on_error_skips_the_rest(home, cfg, log, wf):
     jobs = [wf("a.json"), wf("b.json"), wf("c.json")]
     deps = fake_deps(waits=[{"status": "error", "error": "node 3 failed"}])

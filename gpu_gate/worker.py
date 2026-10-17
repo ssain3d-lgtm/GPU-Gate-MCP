@@ -18,7 +18,9 @@
 Steps 4 and 5 run in `finally` blocks, so Strata is reloaded whatever happens in steps 2-3, even
 after the client that asked for the batch has gone away. During step 3 Strata's /health is looked at
 every 10 s: when the engine comes back (the user started a chat), the batch notes it once in
-`warnings` and goes on without unloading it again.
+`warnings` and goes on without unloading it again. A cancel is seen by the step-3 waits, at the
+start of step 2, while step 2 waits for an executor someone else started, and once more before
+step 3: the jobs not yet run become `cancelled` and steps 4-5 run as usual.
 
 Every external effect goes through `Deps`, so the tests script it; `default_deps` binds the real
 adapters. Progress goes to the batch file and state.json at each transition. Results hold paths,
@@ -448,7 +450,7 @@ class _Run:
             if go:
                 try:
                     self._transition("starting")
-                    if self._start_executor():
+                    if self._start_executor() and not self._cancelled_early("the jobs started"):
                         self._transition("running")
                         self._run_jobs()
                 except Exception as err:
@@ -528,10 +530,28 @@ class _Run:
     def _port(self) -> int:
         return procs.url_port(self._executor_cfg().url)
 
+    def _cancelled_early(self, before: str) -> bool:
+        """Steps 1-2 do not wait on `probe`: the cancel flag is looked at here instead. When it is
+        set, every undecided job becomes `cancelled` and the batch goes straight to steps 4-5."""
+        if not (self.cancelled or state.is_cancelled(self.home, self.batch_id)):
+            return False
+        self.cancelled = True
+        warning = f"cancelled before {before}"
+        self.log(f"worker: cancel requested; {warning}")
+        self.warnings.append(warning)
+        for entry in self.entries:
+            if entry["status"] is None:
+                entry["status"] = "cancelled"
+        return True
+
     def _ready_within(self, timeout: float) -> bool:
-        """Look at the executor once a second until it answers; False when timeout passes first."""
+        """Look at the executor once a second until it answers; False when timeout passes first or
+        the batch is cancelled (self.cancelled then says so)."""
         t0 = self.deps.now()
         while self.deps.now() - t0 < timeout:
+            if state.is_cancelled(self.home, self.batch_id):
+                self.cancelled = True
+                return False
             self.deps.sleep(READY_POLL_S)
             if self.deps.exec_ready():
                 return True
@@ -551,6 +571,8 @@ class _Run:
         """Step 2. True when the executor is up."""
         executor = self.result["executor"]
         timeout = self._executor_cfg().start_timeout_s
+        if self._cancelled_early("the executor started"):
+            return False
         if self.deps.exec_ready():
             self.log(f"worker: {self.kind} is already running; using it")
             self.executor_up = True
@@ -562,6 +584,8 @@ class _Run:
             self.log(f"worker: port {port} is in use but {self.kind} does not answer yet; waiting for it")
             if self._ready_within(timeout):
                 return self._reuse_external(f"executor was already starting on port {port}; reused it")
+            if self.cancelled and self._cancelled_early("the executor started"):
+                return False
             self._fail(f"{self.kind} on port {port} (started outside the gate) did not answer within {timeout} s")
             self._skip_undecided()
             return False
@@ -573,6 +597,8 @@ class _Run:
             self.log(f"worker: {self.kind} process already starting (pid {pids}); waiting for it")
             if self._ready_within(timeout):
                 return self._reuse_external(f"executor was already starting (pid {pids}); reused it")
+            if self.cancelled and self._cancelled_early("the executor started"):
+                return False
             self._fail(f"{self.kind} (pid {pids}, started outside the gate) did not answer within {timeout} s")
             self._skip_undecided()
             return False
@@ -598,6 +624,8 @@ class _Run:
                         f"{self.kind} started by the gate exited with code {code}, but another one "
                         f"answers on port {self._port()}; reused it"
                     )
+                if self.cancelled and self._cancelled_early("the executor started"):
+                    return False
                 self._fail(f"{self.kind} exited with code {code} before it was ready")
             else:
                 self._fail(f"{self.kind} not ready after {timeout} s")
