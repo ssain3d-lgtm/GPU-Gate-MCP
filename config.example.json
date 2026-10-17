@@ -24,5 +24,7 @@
     "job_timeout_s": 1800,
     "batch_timeout_s": 9000
   },
-  "other_llm_ports": [8081]
+  "other_llm_ports": [
+    8081
+  ]
 }
