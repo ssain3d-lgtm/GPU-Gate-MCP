@@ -1,7 +1,7 @@
 import pytest
 
-from fakes import FakeClock, FakeStrata
-from gpu_gate.config import StrataCfg
+from fakes import FakeClock, FakeComfy, FakeStrata
+from gpu_gate.config import ComfyCfg, StrataCfg
 
 API_KEY = "test-key"
 
@@ -45,3 +45,32 @@ def fake_strata_unloaded(strata_factory):
 @pytest.fixture
 def fake_strata_load_fails(strata_factory):
     return strata_factory(loaded=False, load_fails=True)
+
+
+@pytest.fixture
+def comfy_factory(tmp_path):
+    """Build (FakeComfy, ComfyCfg) pairs from FakeComfy keyword arguments; all are stopped at the end.
+
+    The config points at tmp_path as the ComfyUI folder, so the default output folder is
+    tmp_path/ComfyUI/output.
+    """
+    started: list[FakeComfy] = []
+
+    def make(**kwargs):
+        fake = FakeComfy(**kwargs)
+        started.append(fake)
+        return fake, ComfyCfg(dir=str(tmp_path), bat="Start ComfyUI.bat", url=fake.start())
+
+    yield make
+    for fake in started:
+        fake.stop()
+
+
+@pytest.fixture
+def fake_comfy(comfy_factory):
+    return comfy_factory()
+
+
+@pytest.fixture
+def fake_comfy_reject(comfy_factory):
+    return comfy_factory(reject=True)

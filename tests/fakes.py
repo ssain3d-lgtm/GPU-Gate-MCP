@@ -204,3 +204,88 @@ class FakeStrata(FakeServer):
             self._transition(True)
             return 200, {"status": "loaded"}
         return super().handle(method, path, body)
+
+
+class FakeComfy(FakeServer):
+    """Mirrors the real ComfyUI endpoints the adapter uses.
+
+    reject: /prompt answers 400 with a node_errors body (node 3 is missing its `images` input).
+    history: {prompt_id: entry}; /history/<id> answers {id: entry} once it is there and {} before
+        (a prompt that is still pending or running); complete() fills it the way ComfyUI does.
+    prompts: the parsed bodies of the /prompt requests that were accepted or rejected.
+    Prompt ids are "p1", "p2", ... in submission order.
+    """
+
+    def __init__(self, reject: bool = False) -> None:
+        super().__init__()
+        self.reject = reject
+        self.history: dict = {}
+        self.prompts: list = []
+
+    def complete(self, prompt_id: str, files=(), error: str | None = None) -> None:
+        """Finish a prompt. files: (filename, subfolder, type) entries of node 9's images output;
+        error: the exception message of an execution_error (the prompt then ends in status error)."""
+        messages: list = [["execution_start", {"prompt_id": prompt_id}]]
+        if error is not None:
+            messages.append(
+                ["execution_error", {"prompt_id": prompt_id, "node_id": "3", "exception_message": error}]
+            )
+        outputs = {}
+        if files:
+            outputs["9"] = {
+                "images": [{"filename": n, "subfolder": s, "type": t} for n, s, t in files]
+            }
+        entry = {
+            "prompt": [],
+            "outputs": outputs,
+            "status": {
+                "status_str": "success" if error is None else "error",
+                "completed": error is None,
+                "messages": messages,
+            },
+        }
+        with self._lock:
+            self.history[prompt_id] = entry
+
+    def handle(self, method, path, body):
+        route = path.split("?", 1)[0]
+        if method == "GET" and route == "/system_stats":
+            return 200, {
+                "system": {"os": "nt", "comfyui_version": "fake"},
+                "devices": [
+                    {"name": "cuda:0 Fake GPU", "vram_total": 32 * 2**30, "vram_free": 30 * 2**30}
+                ],
+            }
+        if method == "POST" and route == "/prompt":
+            self.prompts.append(json.loads(body.decode("utf-8")))
+            if self.reject:
+                return 400, {
+                    "error": {
+                        "type": "prompt_outputs_failed_validation",
+                        "message": "Prompt outputs failed validation",
+                        "details": "",
+                    },
+                    "node_errors": {
+                        "3": {
+                            "errors": [
+                                {
+                                    "type": "required_input_missing",
+                                    "message": "Required input is missing",
+                                    "details": "images",
+                                    "extra_info": {"input_name": "images"},
+                                }
+                            ],
+                            "dependent_outputs": ["9"],
+                            "class_type": "LoadImage",
+                        }
+                    },
+                }
+            return 200, {"prompt_id": f"p{len(self.prompts)}", "number": len(self.prompts) - 1, "node_errors": {}}
+        if method == "GET" and route.startswith("/history/"):
+            prompt_id = route[len("/history/"):]
+            return 200, ({prompt_id: self.history[prompt_id]} if prompt_id in self.history else {})
+        if method == "POST" and route in ("/free", "/interrupt"):
+            return 200, b""  # the real server answers with an empty body
+        if method == "GET" and route == "/queue":
+            return 200, {"queue_running": [], "queue_pending": []}
+        return super().handle(method, path, body)
