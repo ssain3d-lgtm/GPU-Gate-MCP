@@ -75,7 +75,7 @@ TOOLS = [
             "all are done and returns per-job status and output file paths. jobs: "
             '{"text": "...", "out": "<output .wav path>", "profile_id": ..., "instruct": ..., '
             '"speed": ..., "language": ...} (the batch script\'s job format). options (all '
-            "optional): job_timeout_s, batch_timeout_s, keep_executor, force."
+            "optional): batch_timeout_s, keep_executor, force."
         ),
         "inputSchema": _BATCH_SCHEMA,
     },

@@ -122,6 +122,10 @@ def test_initialize_and_tools_list(server):
     assert [t["name"] for t in tools] == ["comfy_batch", "voice_batch", "gate_status"]
     status = tools[2]
     assert status["annotations"]["readOnlyHint"] is True
+    # The worker ignores job_timeout_s for voice batches: the description must not offer it.
+    voice = tools[1]["description"]
+    assert "job_timeout_s" not in voice
+    assert all(option in voice for option in ("batch_timeout_s", "keep_executor", "force"))
     assert server.handle(rpc("ping"))["result"] == {}
     assert server.handle(rpc("resources/list"))["result"] == {"resources": []}
     assert server.handle(rpc("prompts/list"))["result"] == {"prompts": []}
