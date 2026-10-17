@@ -350,7 +350,11 @@ def fake_deps(
     comfy_running: bool = False,
     ready=None,
     port_busy: bool = False,
+    starting=(),
+    proc_pid: int = 4242,
     proc_code: int | None = None,
+    listeners=None,
+    children=None,
     variant_error: str | None = None,
     start_error: Exception | None = None,
     cold_start_s: float | None = 12.0,
@@ -371,7 +375,10 @@ def fake_deps(
     comfy_running: exec_ready answers True (an executor someone else started).
     ready: a list of exec_ready answers in call order (the last one repeats); wins over comfy_running.
     port_busy: what exec_port_busy answers (something listens on the executor's port).
-    proc_code: the exit code the started FakeProc reports (None = still running).
+    starting: the pids exec_starting reports (executor processes found by their command line).
+    proc_pid / proc_code: the pid and exit code of the FakeProc exec_start returns (None = running).
+    listeners: what exec_listener_pids answers (default: the started FakeProc's pid, none before).
+    children: {pid: [descendant pids]} for descendants (default: none), or an exception it raises.
     variant_error: what exec_validate_variant answers (None = the variant is fine).
     start_error: exec_start raises it. cold_start_s: what exec_wait_ready returns (None = never ready).
     load_errors: {workflow basename: exception} for exec_load_workflow. submit_error: every
@@ -391,6 +398,7 @@ def fake_deps(
     calls: list = []
     engine = {"loaded": strata_loaded}
     counters = {"health": 0, "submit": 0, "wait": 0, "command": 0, "ready": 0}
+    spawned: list = []
 
     def exec_ready():
         if ready is None:
@@ -425,7 +433,18 @@ def fake_deps(
     def exec_start(log_path, log, bat_override=None):
         if start_error is not None:
             raise start_error
-        return FakeProc(code=proc_code)
+        spawned.append(FakeProc(pid=proc_pid, code=proc_code))
+        return spawned[-1]
+
+    def exec_listener_pids():
+        if listeners is not None:
+            return list(listeners)
+        return [spawned[-1].pid] if spawned else []
+
+    def descendants(pid):
+        if isinstance(children, BaseException):
+            raise children
+        return list((children or {}).get(pid, []))
 
     def exec_load_workflow(path):
         error = (load_errors or {}).get(os.path.basename(path))
@@ -475,6 +494,10 @@ def fake_deps(
         "strata_resume": strata_resume,
         "exec_ready": exec_ready,
         "exec_port_busy": lambda: port_busy,
+        "exec_starting": lambda: list(starting),
+        "exec_listener_pids": exec_listener_pids,
+        "descendants": descendants,
+        "kill_tree": lambda pid: True,
         "exec_validate_variant": lambda name: variant_error,
         "exec_start": exec_start,
         "exec_wait_ready": lambda proc, timeout_s: cold_start_s,

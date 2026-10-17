@@ -25,6 +25,7 @@ from .config import ComfyCfg
 
 READY_POLL_S = 1.0  # how often wait_ready asks /system_stats
 WAIT_POLL_S = 1.5  # how often wait asks /history
+PROCESS_ENDED = "comfyui process ended"  # wait's error when the ComfyUI process is gone
 SUBMIT_TIMEOUT_S = 30  # ComfyUI validates the whole workflow before it answers /prompt
 FREE_TIMEOUT_S = 30
 OUTPUT_KEYS = ("images", "gifs", "videos", "audio")  # the keys of a history output that hold files
@@ -385,7 +386,7 @@ def wait(
                 return result("done", _output_paths(cfg, entry))
         if alive is not None and not alive():
             outputs = _output_paths(cfg, entry) if isinstance(entry, dict) else []
-            return result("error", outputs, "comfyui process ended")
+            return result("error", outputs, PROCESS_ENDED)
         if cancelled():
             http.http_json(cfg.url.rstrip("/") + "/interrupt", "POST")
             return result("cancelled")

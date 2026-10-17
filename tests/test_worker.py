@@ -78,7 +78,15 @@ def calls_to(deps, name):
 def test_happy_path_runs_the_six_steps_in_order(home, cfg, log, wf):
     deps = fake_deps()
     r = worker.run_batch(home, batch(jobs=[wf("a.json"), wf("b.json")]), cfg, deps, log)
-    assert [c[0] for c in deps.calls] == ["other_llm_alive", "strata_health", "strata_pause", "exec_ready", "exec_port_busy", "exec_start", "exec_wait_ready", "exec_submit", "exec_submit", "exec_wait", "exec_wait", "exec_free", "exec_stop", "pid_vram_gone", "strata_resume"]
+    # Step 2 on the happy path: nothing answers, nothing holds the port and no executor process is
+    # starting (exec_starting), so the gate starts one; once it answers, the port's listener is the
+    # gate's own process (exec_listener_pids), so descendants is never asked.
+    assert [c[0] for c in deps.calls] == [
+        "other_llm_alive", "strata_health", "strata_pause",
+        "exec_ready", "exec_port_busy", "exec_starting", "exec_start", "exec_wait_ready", "exec_listener_pids",
+        "exec_submit", "exec_submit", "exec_wait", "exec_wait",
+        "exec_free", "exec_stop", "pid_vram_gone", "strata_resume",
+    ]
     assert r["ok"] and [j["status"] for j in r["jobs"]] == ["done", "done"] and r["executor"]["started_by_gate"] and r["strata"]["restored"]
     assert [j["name"] for j in r["jobs"]] == ["a.json", "b.json"]
     assert r["jobs"][0]["outputs"] == ["out/p1.png"]
@@ -203,6 +211,94 @@ def test_gate_started_executor_lost_the_port_to_an_external_one(home, cfg, log, 
     assert any(f"port {port}" in w and "reused" in w for w in r["warnings"])
     assert r["ok"] and r["error"] is None and [j["status"] for j in r["jobs"]] == ["done"]
     assert calls_to(deps, "exec_stop")[0][1][0] is None  # by its port, not the gate's dead process
+
+
+def test_external_executor_found_by_its_command_line_is_waited_for(home, cfg, log, wf):
+    # ComfyUI started from outside binds its port only when it is nearly ready (40-60 s later):
+    # the port is free, but its process is there. It is waited for, not started a second time.
+    deps = fake_deps(ready=[False, False, False, True], starting=[4321])
+    r = worker.run_batch(home, batch([wf("a.json")]), cfg, deps, log)
+    assert "exec_start" not in names(deps) and "exec_wait_ready" not in names(deps)
+    assert names(deps).index("exec_port_busy") < names(deps).index("exec_starting")
+    assert names(deps).count("exec_starting") == 1 and names(deps).count("exec_ready") == 4
+    assert deps.clock.sleeps == [1, 1, 1]  # ready on the third look
+    assert "executor was already starting (pid 4321); reused it" in r["warnings"]
+    assert r["executor"] == {"kind": "comfyui", "started_by_gate": False, "cold_start_s": None, "stopped": True}
+    assert calls_to(deps, "exec_stop")[0][1][0] is None  # external: stopped by its port
+    assert r["ok"] and [j["status"] for j in r["jobs"]] == ["done"]
+    assert "kill_tree" not in names(deps)
+
+
+def test_external_executor_process_that_never_answers_is_left_alone(home, cfg, log, wf):
+    deps = fake_deps(starting=[4321])
+    r = worker.run_batch(home, batch([wf("a.json")]), cfg, deps, log)
+    assert "exec_start" not in names(deps) and "exec_stop" not in names(deps) and "kill_tree" not in names(deps)
+    assert "4321" in r["error"] and "did not answer" in r["error"] and r["ok"] is False
+    assert [j["status"] for j in r["jobs"]] == ["skipped"] and r["strata"]["restored"]
+
+
+def test_exec_starting_is_not_asked_when_the_port_is_busy(home, cfg, log, wf):
+    deps = fake_deps(ready=[False, True], port_busy=True, starting=[4321])
+    worker.run_batch(home, batch([wf("a.json")]), cfg, deps, log)
+    assert "exec_starting" not in names(deps)
+
+
+def test_port_owned_by_another_process_makes_the_gates_executor_external(home, cfg, log, logs, wf):
+    # The gate started pid 100, but the process that answers on the port is 555, which is not 100
+    # or one of its children: an external ComfyUI won the port. The gate's own one is ended, the
+    # jobs are not tied to it, and step 4 stops the one on the port.
+    deps = fake_deps(proc_pid=100, listeners=[555], children={100: []})
+    r = worker.run_batch(home, batch([wf("a.json"), wf("b.json")]), cfg, deps, log)
+    port = procs.url_port(cfg.comfyui.url)
+    warning = f"executor on port {port} is not the process the gate started (pid 100); treating it as external"
+    assert warning in r["warnings"]
+    assert calls_to(deps, "descendants") == [("descendants", (100,), {})]
+    assert calls_to(deps, "kill_tree") == [("kill_tree", (100,), {})]
+    assert names(deps).index("kill_tree") < names(deps).index("exec_submit")
+    assert [c[2]["alive"] for c in calls_to(deps, "exec_wait")] == [None, None]
+    assert calls_to(deps, "exec_stop")[0][1][0] is None  # by its port
+    assert r["executor"] == {"kind": "comfyui", "started_by_gate": False, "cold_start_s": None, "stopped": True}
+    assert r["ok"] and [j["status"] for j in r["jobs"]] == ["done", "done"] and r["error"] is None
+
+    # keep_executor now keeps it, as for any external executor; stopped says so.
+    deps = fake_deps(proc_pid=100, listeners=[555], children={100: []})
+    r = worker.run_batch(home, batch([wf("a.json")], {"keep_executor": True}), cfg, deps, log)
+    assert "kill_tree" in names(deps) and "exec_stop" not in names(deps)
+    assert r["executor"]["started_by_gate"] is False and r["executor"]["stopped"] is False and r["ok"]
+
+
+def test_port_owned_by_a_child_of_the_gates_process_stays_the_gates(home, cfg, log, wf):
+    # A start script (powershell, cmd) whose child listens: still the gate's own executor.
+    deps = fake_deps(proc_pid=100, listeners=[777], children={100: [777]})
+    r = worker.run_batch(home, batch([wf("a.json")]), cfg, deps, log)
+    assert "kill_tree" not in names(deps) and r["warnings"] == []
+    assert r["executor"] == {"kind": "comfyui", "started_by_gate": True, "cold_start_s": 12.0, "stopped": True}
+    assert calls_to(deps, "exec_wait")[0][2]["alive"] is not None
+    assert calls_to(deps, "exec_stop")[0][1][0].pid == 100  # by the gate's process
+
+
+def test_unknown_port_owner_keeps_the_executor_the_gates(home, cfg, log, logs, wf):
+    # No listener listed (the lookup failed) or no process table: nothing proves the executor is
+    # someone else's, so the gate's own process is neither ended nor given up.
+    for deps in (
+        fake_deps(proc_pid=100, listeners=[]),
+        fake_deps(proc_pid=100, listeners=[555], children=OSError("the process list could not be read")),
+    ):
+        r = worker.run_batch(home, batch([wf("a.json")]), cfg, deps, log)
+        assert "kill_tree" not in names(deps) and r["executor"]["started_by_gate"] is True
+        assert calls_to(deps, "exec_stop")[0][1][0].pid == 100 and r["ok"]
+    assert any("could not tell" in line for line in logs)
+
+
+def test_executor_that_died_mid_batch_sets_the_batch_error(home, cfg, log, wf):
+    deps = fake_deps(waits=[{"status": "error", "error": "comfyui process ended"}, "done"])
+    r = worker.run_batch(home, batch([wf("a.json"), wf("b.json")]), cfg, deps, log)
+    assert r["jobs"][0]["error"] == "comfyui process ended"
+    assert r["error"] == "executor died during the batch" and r["ok"] is False
+
+    deps = fake_deps(waits=[{"status": "error", "error": "node 3 failed"}])
+    r = worker.run_batch(home, batch([wf("a.json")]), cfg, deps, log)
+    assert r["error"] is None  # an ordinary job error stays the job's
 
 
 def test_port_busy_asks_for_listeners_on_the_executor_port(monkeypatch):
@@ -541,15 +637,29 @@ def test_default_deps_binds_the_adapters_by_kind(cfg):
     assert d.exec_free.func is comfyui.free and d.exec_stop.func is comfyui.stop
     assert d.exec_delete_pending.func is comfyui.delete_pending
     assert d.exec_load_workflow is comfyui.load_workflow
+    folded = str(cfg.comfyui.dir).replace("\\", "/").rstrip("/").lower()
+    assert d.exec_starting.func is worker._starting_pids and d.exec_starting.args == (["main.py", folded],)
+    assert d.exec_listener_pids.func is procs.listener_pids and d.exec_listener_pids.args == (8188,)
+    assert d.descendants is procs.descendants and d.kill_tree is procs.kill_tree
 
     v = worker.default_deps(cfg, "voicestudio")
     assert v.exec_ready.func is voicestudio.ready and v.exec_ready.args == (cfg.voicestudio,)
     assert v.exec_port_busy.func is worker._port_busy and v.exec_port_busy.args == (cfg.voicestudio.url,)
     assert v.exec_start.func is voicestudio.start and v.exec_wait_ready.func is voicestudio.wait_ready
     assert v.exec_stop.func is voicestudio.stop
+    assert v.exec_starting.args == (["uvicorn", "backend.main"],)
+    assert v.exec_listener_pids.args == (procs.url_port(cfg.voicestudio.url),)
     assert v.voice_run_batch.func is voicestudio.run_batch and v.voice_run_batch.args == (cfg.voicestudio,)
     assert v.exec_free() is True  # VoiceStudio has no /free; its batch script unloads the model
     assert v.exec_validate_variant("anything.bat") is None  # VoiceStudio has no variants
 
     with pytest.raises(ValueError):
         worker.default_deps(cfg, "blender")
+
+
+def test_starting_pids_needs_every_marker(monkeypatch):
+    asked = []
+    monkeypatch.setattr(procs, "find_pids", lambda markers: asked.append(markers) or [9])
+    assert worker._starting_pids(["main.py", "x:/comfy"]) == [9]
+    assert worker._starting_pids(["main.py", ""]) == []  # no comfyui.dir: never match any main.py
+    assert asked == [["main.py", "x:/comfy"]]

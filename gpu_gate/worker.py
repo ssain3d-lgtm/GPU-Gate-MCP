@@ -4,7 +4,10 @@
       (`options.force` overrides the last)
     1 pause Strata (unload its engine)
     2 start the executor (ComfyUI or VoiceStudio), or reuse the one that is already up (also one
-      that holds its port but is still starting: it is waited for, never started a second time)
+      that is still starting, found by its busy port or by its process's command line: it is waited
+      for, never started a second time); when the gate started one, the process on the port is
+      checked once it answers, and one that is not the gate's (an external start won the port)
+      makes the executor external
     3 run the jobs in order, in segments: consecutive workflows are queued together and then waited
       for one by one; a command runs once every earlier job has finished (VoiceStudio: one run of
       the batch script for all jobs)
@@ -60,6 +63,10 @@ class Deps:
     strata_resume: Callable[[Log], dict]
     exec_ready: Callable[[], bool]
     exec_port_busy: Callable[[], bool]  # something listens on the executor's port (it may be starting)
+    exec_starting: Callable[[], list]  # pids of executor processes found by their command line
+    exec_listener_pids: Callable[[], list]  # pids listening on the executor's port
+    descendants: Callable[[int], list]  # (pid) -> every process it started; OSError when unknown
+    kill_tree: Callable[[int], bool]  # (pid) -> True when it and its children are gone
     exec_validate_variant: Callable[[Any], str | None]  # (comfy_variant) -> why it is refused, or None
     exec_start: Callable[..., Any]  # (log_path, log, bat_override=None) -> Popen
     exec_wait_ready: Callable[[Any, float], float | None]  # (proc, timeout_s)
@@ -96,6 +103,19 @@ def _tcp_alive(ports: list[int]) -> list[int]:
 def _port_busy(url: str) -> bool:
     """True when a process listens on the TCP port of url (an executor that may still be starting)."""
     return bool(procs.listener_pids(procs.url_port(url)))
+
+
+def _fold_path(path: str | None) -> str:
+    """A folder as procs.find_pids compares it: forward slashes, lower case, no trailing slash."""
+    return (path or "").replace("\\", "/").rstrip("/").lower()
+
+
+def _starting_pids(markers: list[str]) -> list[int]:
+    """Processes whose command line holds every marker (an executor that may still be starting);
+    none when a marker is empty (no folder configured), so not every `main.py` on the PC matches."""
+    if not all(markers):
+        return []
+    return procs.find_pids(markers)
 
 
 def _run_command(
@@ -147,10 +167,12 @@ def default_deps(cfg: config.Config, kind: str = "comfyui") -> Deps:
         executor, ecfg = comfyui, cfg.comfyui
         free = functools.partial(comfyui.free, cfg.comfyui)
         validate_variant = functools.partial(comfyui.variant_error, cfg.comfyui)
+        markers = ["main.py", _fold_path(cfg.comfyui.dir)]
     elif kind == "voicestudio":
         executor, ecfg = voicestudio, cfg.voicestudio
         free = _nothing_to_free
         validate_variant = _no_variants
+        markers = ["uvicorn", "backend.main"]
     else:
         raise ValueError(f"unknown batch kind: {kind!r}")
     sleep, now = time.sleep, time.monotonic
@@ -161,6 +183,10 @@ def default_deps(cfg: config.Config, kind: str = "comfyui") -> Deps:
         strata_resume=functools.partial(strata.resume, cfg.strata, **clock),
         exec_ready=functools.partial(executor.ready, ecfg),
         exec_port_busy=functools.partial(_port_busy, ecfg.url),
+        exec_starting=functools.partial(_starting_pids, markers),
+        exec_listener_pids=functools.partial(procs.listener_pids, procs.url_port(ecfg.url)),
+        descendants=procs.descendants,
+        kill_tree=procs.kill_tree,
         exec_validate_variant=validate_variant,
         exec_start=functools.partial(executor.start, ecfg),
         exec_wait_ready=functools.partial(executor.wait_ready, ecfg, **clock),
@@ -430,6 +456,7 @@ class _Run:
                     self._fail(_describe(err))
                 finally:
                     self.watching = False
+                    self._note_executor_death()
                     self._skip_undecided()
                     self._transition("cleanup")
                     self._cleanup()
@@ -538,6 +565,17 @@ class _Run:
             self._fail(f"{self.kind} on port {port} (started outside the gate) did not answer within {timeout} s")
             self._skip_undecided()
             return False
+        starting = self.deps.exec_starting()
+        if starting:
+            # Its process is there but it has not bound the port yet (ComfyUI binds it only when it
+            # is nearly ready, 40-60 s after its start): same as a busy port.
+            pids = ", ".join(str(pid) for pid in starting)
+            self.log(f"worker: {self.kind} process already starting (pid {pids}); waiting for it")
+            if self._ready_within(timeout):
+                return self._reuse_external(f"executor was already starting (pid {pids}); reused it")
+            self._fail(f"{self.kind} (pid {pids}, started outside the gate) did not answer within {timeout} s")
+            self._skip_undecided()
+            return False
         variant = self.options.get("comfy_variant") if self.kind == "comfyui" else None
         try:
             self.proc = self.deps.exec_start(self.log_path, self.log, bat_override=variant)
@@ -567,11 +605,49 @@ class _Run:
             return False
         executor["cold_start_s"] = cold
         self.log(f"worker: {self.kind} ready after {cold:.0f} s")
+        self._check_owner()
         return True
+
+    def _check_owner(self) -> None:
+        """After the gate's executor answered: is the process on the port the gate's (its pid or a
+        descendant)? One started from outside at the same time may have won the port. Then the
+        answer came from that one: the gate's own process is ended, the jobs are not tied to it, and
+        step 4 treats the executor as external. When the owner cannot be told (no listener listed,
+        no process table), the executor stays the gate's, as before this check."""
+        pid = self.proc.pid
+        listeners = self._guarded("port listener lookup", self.deps.exec_listener_pids, [])
+        if not listeners or pid in listeners:
+            if not listeners:
+                self.log(f"worker: could not tell which process listens on port {self._port()}")
+            return
+        try:
+            family = set(self.deps.descendants(pid))
+        except OSError as err:
+            self.log(f"worker: could not tell whether port {self._port()} is pid {pid}'s: {err}")
+            return
+        if family.intersection(listeners):
+            return
+        warning = (
+            f"executor on port {self._port()} is not the process the gate started (pid {pid}); "
+            "treating it as external"
+        )
+        self.log(f"worker: {warning} (listeners {listeners})")
+        self.warnings.append(warning)
+        self._guarded(f"stopping the gate's own {self.kind}", lambda: self.deps.kill_tree(pid), False)
+        self._guarded("collecting its exit status", self.proc.poll, None)
+        self.proc = None
+        executor = self.result["executor"]
+        executor["started_by_gate"] = False
+        executor["cold_start_s"] = None
 
     def _alive(self) -> Callable[[], bool] | None:
         proc = self.proc
         return None if proc is None else (lambda: proc.poll() is None)
+
+    def _note_executor_death(self) -> None:
+        """A job that ended because the executor's process ended makes it the batch's error too."""
+        if any(entry["error"] == comfyui.PROCESS_ENDED for entry in self.entries):
+            self._fail("executor died during the batch")
 
     def _run_jobs(self) -> None:
         """Step 3."""
