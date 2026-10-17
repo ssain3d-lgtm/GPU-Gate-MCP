@@ -291,7 +291,9 @@ ComfyUI 시작 `.bat` 은 이렇게 읽는다. `set NAME=값` 줄들은 환경�
 | 결과 `error`: `strata pause failed: busy` | Strata 가 긴 생성을 하고 있었다. 게이트는 응답이 끝나기를 15분까지 기다린 뒤 포기하며, 이때 LLM 은 건드리지 않았다. 나중에 다시 부른다. |
 | 결과 `error`: `comfyui not ready after N s` / `comfyui exited with code N before it was ready` | ComfyUI 가 제때 뜨지 못했다. 로그에 ComfyUI 의 출력이 있다. 느린 PC 이면 `comfyui.start_timeout_s` 를 늘린다. |
 | 결과 `error`: `comfyui on port N (started outside the gate) did not answer within N s` | 그 포트를 다른 프로세스가 잡고 있는데 응답하지 않았다(밖에서 띄운 ComfyUI 가 멈췄거나, 다른 프로그램이 포트를 쓴다). 게이트는 자기가 띄우지 않은 그 프로세스를 끄지 않는다. 직접 확인하고 끈 뒤 다시 부른다. |
-| 경고 `executor was already starting on port N; reused it` | 밖에서 막 띄운 실행기가 아직 뜨는 중이라 기다렸다가 썼다. 정상이다. `keep_executor` 가 아니면 배치 뒤에 그것을 끈다. |
+| 경고 `executor was already starting on port N; reused it` / `executor was already starting (pid N); reused it` | 밖에서 막 띄운 실행기가 아직 뜨는 중이라 기다렸다가 썼다. 정상이다. 포트를 아직 잡지 않은 것(ComfyUI 는 시작 뒤 40~60초에야 잡는다)도 프로세스 명령줄(`comfyui.dir` 아래의 `main.py`, VoiceStudio 는 `uvicorn backend.main`)로 찾아낸다. `keep_executor` 가 아니면 배치 뒤에 그것을 끈다. |
+| 경고 `executor on port N is not the process the gate started (pid N); treating it as external` | 게이트가 띄운 것과 밖에서 띄운 것이 함께 떴고 밖의 것이 포트를 잡았다. 게이트는 준비 뒤 포트를 잡은 프로세스가 자기 것(또는 그 자식)인지 확인하고, 아니면 자기 것을 끄고 그 실행기를 외부 것으로 다룬다(잡은 거기서 돌고, 배치 뒤 포트로 끈다). |
+| 결과 `error`: `executor died during the batch` | 실행기 프로세스가 배치 도중 사라졌다(잡 `error`: `comfyui process ended`). 로그에서 ComfyUI 의 마지막 출력을 본다. |
 | `strata.restored: false`, 결과 `error`: `strata resume failed: ...` | LLM 이 올라오지 않았다(3번 시도). 로그를 보고 Strata 에 직접 `POST /load` 를 보내거나 재시작한다. |
 | 에이전트가 도중에 호출을 끊었다 | 클라이언트의 도구 타임아웃이 배치보다 짧다. 정확히 5분(Qwen Code `mcp.toolIdleTimeoutMs`)이나 7분(Hermes `timeouts.tools.sequential_call`)에 끊겼다면 서버 항목의 `timeout` 이 아닌 그 키다. [docs/clients.md](docs/clients.md) 의 값으로 늘린다. |
 
