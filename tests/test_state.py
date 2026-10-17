@@ -201,6 +201,24 @@ def test_write_lock_rewrites_the_pid_and_release_removes_it(home, dead_pid):
     state.release_lock(home)  # releasing a missing lock is not an error
 
 
+def test_release_lock_retries_unlink_while_a_reader_holds_the_lock(home, monkeypatch):
+    state.write_lock(home, "a", os.getpid())
+    real_unlink = os.unlink
+    calls = []
+
+    def flaky_unlink(path, *args, **kwargs):
+        calls.append(path)
+        if len(calls) <= 2:
+            raise PermissionError(13, "sharing violation")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(state.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(os, "unlink", flaky_unlink)
+    state.release_lock(home)
+    assert len(calls) == 3
+    assert not state.paths(home).lock.exists()
+
+
 def test_cancel_flag_round_trip(home):
     assert not state.is_cancelled(home, "a")
     state.request_cancel(home, "a")

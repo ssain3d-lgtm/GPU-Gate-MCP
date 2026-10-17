@@ -32,9 +32,9 @@ ENV_HOME = "GPU_GATE_HOME"
 # Batch states that mean the batch is over; a stale lock must not rewrite these.
 FINISHED_STATES = ("done", "failed", "aborted")
 
-# An external UI polling a file can hold it open while we replace it; retry briefly.
-_REPLACE_TRIES = 10
-_REPLACE_PAUSE_SECONDS = 0.05
+# An external UI polling a file can hold it open while we replace or delete it; retry briefly.
+_SHARING_TRIES = 10
+_SHARING_PAUSE_SECONDS = 0.05
 
 _IDLE_STATE ={"state": "idle", "batch_id": None, "updated": None, "last_result": None}
 
@@ -97,17 +97,20 @@ def read_json(path: Path | str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _replace_with_retry(src: str, dst: Path) -> None:
-    """os.replace, retrying while a reader holds dst open (Windows sharing violation)."""
-    for attempt in range(_REPLACE_TRIES):
+def _retry_sharing(fn):
+    """Call fn(), retrying while a reader holds the file open (Windows sharing violation).
+
+    Only PermissionError / winerror 5 or 32 are retried, up to _SHARING_TRIES attempts in all;
+    every other error, and the last failed attempt, is re-raised.
+    """
+    for attempt in range(_SHARING_TRIES):
         try:
-            os.replace(src, dst)
-            return
+            return fn()
         except OSError as err:
             sharing = isinstance(err, PermissionError) or getattr(err, "winerror", None) in (5, 32)
-            if not sharing or attempt == _REPLACE_TRIES - 1:
+            if not sharing or attempt == _SHARING_TRIES - 1:
                 raise
-            time.sleep(_REPLACE_PAUSE_SECONDS)
+            time.sleep(_SHARING_PAUSE_SECONDS)
 
 
 def write_json(path: Path | str, data: dict) -> None:
@@ -119,7 +122,7 @@ def write_json(path: Path | str, data: dict) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
-        _replace_with_retry(tmp, target)
+        _retry_sharing(lambda: os.replace(tmp, target))
     except BaseException:
         try:
             os.unlink(tmp)
@@ -161,8 +164,9 @@ def current_lock(home: Path | str) -> dict | None:
 
 
 def release_lock(home: Path | str) -> None:
+    lock = paths(home).lock
     try:
-        paths(home).lock.unlink()
+        _retry_sharing(lambda: os.unlink(lock))
     except FileNotFoundError:
         pass
 
